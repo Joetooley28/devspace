@@ -30,6 +30,8 @@ export interface SkillReadResolution {
 }
 
 const SKILL_URI_PREFIX = "skills://";
+const MAX_SKILL_NAME_LENGTH = 64;
+const SKILL_NAME_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SUBAGENTS_SKILL_NAME = "subagents";
 const SUBAGENTS_SKILL = join(SUBAGENTS_SKILL_NAME, "SKILL.md");
 
@@ -109,7 +111,11 @@ export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSk
   });
 
   const withoutSubagents = withoutSubagentsSkill(result);
-  if (!config.subagents.enabled) return withoutSubagents;
+  const routable = {
+    skills: withoutSubagents.skills.filter((skill) => isRoutableSkillName(skill.name)),
+    diagnostics: withoutSubagents.diagnostics,
+  };
+  if (!config.subagents.enabled) return routable;
 
   const managedDir = dirname(join(config.devspaceSkillsDir, SUBAGENTS_SKILL));
   const managed = loadSkillsFromDir({
@@ -121,8 +127,8 @@ export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSk
   }
 
   return {
-    skills: [...withoutSubagents.skills, managed],
-    diagnostics: withoutSubagents.diagnostics,
+    skills: [...routable.skills, managed],
+    diagnostics: routable.diagnostics,
   };
 }
 
@@ -154,6 +160,9 @@ export function resolveSkillReadPath(
   if (!skillName) {
     throw new Error(`Invalid skill URI: ${inputPath}`);
   }
+  if (!isRoutableSkillName(skillName)) {
+    throw new Error(`Invalid skill URI: ${inputPath}`);
+  }
 
   const skill = skills.find((candidate) => candidate.name === skillName);
   if (!skill) {
@@ -174,5 +183,12 @@ export function resolveSkillReadPath(
 }
 
 export function formatSkillUri(skill: Skill): string {
+  if (!isRoutableSkillName(skill.name)) {
+    throw new Error(`Invalid skill name for skills:// URI: ${skill.name}`);
+  }
   return `${SKILL_URI_PREFIX}${skill.name}`;
+}
+
+function isRoutableSkillName(name: string): boolean {
+  return name.length <= MAX_SKILL_NAME_LENGTH && SKILL_NAME_PATTERN.test(name);
 }

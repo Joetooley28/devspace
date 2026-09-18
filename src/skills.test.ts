@@ -35,6 +35,7 @@ try {
   await mkdir(join(agentDir, "skills", "subagents"), { recursive: true });
   await mkdir(join(explicitSkills, "duplicate"), { recursive: true });
   await mkdir(join(explicitSkills, "disabled"), { recursive: true });
+  await mkdir(join(explicitSkills, "invalid-name"), { recursive: true });
   await mkdir(join(explicitSkills, "subagents"), { recursive: true });
   await mkdir(join(devspaceSkills, "devspace-local-skill"), { recursive: true });
 
@@ -160,6 +161,17 @@ try {
       "# Hidden Skill",
     ].join("\n"),
   );
+  await writeFile(
+    join(explicitSkills, "invalid-name", "SKILL.md"),
+    [
+      "---",
+      "name: foo/bar",
+      "description: Invalid skill name.",
+      "---",
+      "",
+      "# Invalid Skill",
+    ].join("\n"),
+  );
 
   const configDir = join(root, ".devspace");
   const disabledConfig = loadConfig(writeTestDevspaceConfig(configDir, {
@@ -187,7 +199,14 @@ try {
   assert.equal(loaded.skills.some((skill) => skill.name === "subagents"), false);
   assert.equal(loaded.skills.filter((skill) => skill.name === "duplicate-skill").length, 1);
   assert.equal(loaded.skills.some((skill) => skill.name === "hidden-skill"), true);
+  assert.equal(loaded.skills.some((skill) => skill.name === "foo/bar"), false);
   assert.equal(loaded.diagnostics.some((diagnostic) => diagnostic.type === "collision"), true);
+  assert.equal(
+    loaded.diagnostics.some(
+      (diagnostic) => diagnostic.message.includes("name contains invalid characters"),
+    ),
+    true,
+  );
   assert.equal(
     loaded.diagnostics.some(
       (diagnostic) => diagnostic.collision?.name === "subagents",
@@ -248,6 +267,10 @@ try {
   const projectSkill = loaded.skills.find((skill) => skill.name === "agent-project-skill");
   assert.ok(projectSkill);
   assert.equal(formatSkillUri(projectSkill), "skills://agent-project-skill");
+  assert.throws(
+    () => formatSkillUri({ ...projectSkill, name: "foo/bar" }),
+    /Invalid skill name/,
+  );
 
   const skillFileRead = resolveSkillReadPath(
     loaded.skills,
@@ -268,6 +291,10 @@ try {
   assert.throws(
     () => resolveSkillReadPath(loaded.skills, "skills://missing"),
     /Unknown skill/,
+  );
+  assert.throws(
+    () => resolveSkillReadPath(loaded.skills, "skills://foo%2Fbar"),
+    /Invalid skill URI/,
   );
   assert.throws(
     () => resolveSkillReadPath(loaded.skills, "skills://agent-project-skill/../secret"),
