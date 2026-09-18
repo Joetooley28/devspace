@@ -9,6 +9,7 @@ import {
   opencodeAgentFor,
   opencodePermissionFor,
   resolveExternalOpencodeTarget,
+  resolveOpencodePromptTimeoutMs,
   type OpencodeClientLike,
   type OpencodeFactory,
 } from "./local-agent-opencode.js";
@@ -75,6 +76,45 @@ assert.equal(
   }),
   undefined,
 );
+assert.equal(resolveOpencodePromptTimeoutMs({}), 5 * 60_000);
+assert.equal(resolveOpencodePromptTimeoutMs({ DEVSPACE_OPENCODE_PROMPT_TIMEOUT_MS: "0" }), 0);
+assert.equal(
+  resolveOpencodePromptTimeoutMs({ DEVSPACE_OPENCODE_PROMPT_TIMEOUT_MS: "1200000" }),
+  1_200_000,
+);
+assert.throws(
+  () => resolveOpencodePromptTimeoutMs({ DEVSPACE_OPENCODE_PROMPT_TIMEOUT_MS: "-1" }),
+  /must be an integer from 0/,
+);
+
+const noTimeoutClient = {
+  global: {
+    async health() {
+      return { data: { healthy: true } };
+    },
+  },
+  session: {
+    async create() {
+      return { data: { id: "session_no_timeout" } };
+    },
+    async prompt() {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      return {
+        data: {
+          info: { role: "assistant" },
+          parts: [{ type: "text", text: "response:no-timeout" }],
+        },
+      };
+    },
+  },
+} as unknown as OpencodeClientLike;
+const noTimeoutRuntime = new OpencodeRuntime(noTimeoutClient, { close() {} }, 0);
+const noTimeoutResult = await noTimeoutRuntime.run({
+  prompt: "long-running prompt",
+  workspaceRoot: "/tmp/project",
+});
+assert.equal(noTimeoutResult.isOk(), true, "zero prompt timeout disables the timer");
+await noTimeoutRuntime.close();
 
 const driver = new OpencodeLocalAgentDriver(factory, { HARNESS_ENV: "opencode" });
 const pool = new LocalAgentRuntimePool();

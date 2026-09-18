@@ -25,6 +25,7 @@ const OPENCODE_SERVER_HOSTNAME = "127.0.0.1";
 const OPENCODE_SERVER_START_TIMEOUT_MS = 15_000;
 const OPENCODE_SERVER_START_ATTEMPTS = 3;
 const OPENCODE_PROMPT_TIMEOUT_MS = 5 * 60_000;
+const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
 const require = createRequire(import.meta.url);
 const spawn = require("cross-spawn") as typeof import("node:child_process").spawn;
 
@@ -130,10 +131,12 @@ export class OpencodeRuntime implements LocalAgentRuntime {
     const controller = new AbortController();
     this.promptControllers.add(controller);
     let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, this.promptTimeoutMs);
+    const timer = this.promptTimeoutMs === 0
+      ? undefined
+      : setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, this.promptTimeoutMs);
     try {
       return await promptOpencodeSession(this.client, sessionId, input, controller.signal);
     } catch (error) {
@@ -147,7 +150,7 @@ export class OpencodeRuntime implements LocalAgentRuntime {
         message: "OpenCode did not finish the prompt before the provider timeout.",
       });
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       this.promptControllers.delete(controller);
     }
   }
@@ -176,10 +179,29 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
       operation: "create_runtime",
       run: async (): Promise<LocalAgentRuntime> => {
         const { client, server, workspaceRoot } = await this.factory(context, this.env);
-        return new OpencodeRuntime(client, server, OPENCODE_PROMPT_TIMEOUT_MS, workspaceRoot);
+        return new OpencodeRuntime(
+          client,
+          server,
+          resolveOpencodePromptTimeoutMs(this.env),
+          workspaceRoot,
+        );
       },
     });
   }
+}
+
+export function resolveOpencodePromptTimeoutMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env.DEVSPACE_OPENCODE_PROMPT_TIMEOUT_MS?.trim();
+  if (!raw) return OPENCODE_PROMPT_TIMEOUT_MS;
+  const timeoutMs = Number(raw);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > MAX_TIMER_TIMEOUT_MS) {
+    throw new Error(
+      `DEVSPACE_OPENCODE_PROMPT_TIMEOUT_MS must be an integer from 0 to ${MAX_TIMER_TIMEOUT_MS}.`,
+    );
+  }
+  return timeoutMs;
 }
 
 interface ExternalOpencodeTarget {
