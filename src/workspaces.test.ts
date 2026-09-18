@@ -362,7 +362,12 @@ test("workspace cache evicts old contexts without losing advertised skill reads"
     const registry = new WorkspaceRegistry(config, store);
     const first = await registry.openWorkspace(context.root);
     assert.equal(
-      (await registry.resolveReadPath(first.workspace, resourceFile)).absolutePath,
+      (
+        await registry.resolveReadPath(
+          first.workspace,
+          "skills://cache-skill/reference.md",
+        )
+      ).absolutePath,
       await realpath(resourceFile),
     );
 
@@ -373,7 +378,12 @@ test("workspace cache evicts old contexts without losing advertised skill reads"
     const restored = await registry.getWorkspace(first.workspace.id);
     assert.notEqual(restored, first.workspace);
     assert.equal(
-      (await registry.resolveReadPath(restored, resourceFile)).absolutePath,
+      (
+        await registry.resolveReadPath(
+          restored,
+          "skills://cache-skill/reference.md",
+        )
+      ).absolutePath,
       await realpath(resourceFile),
     );
   } finally {

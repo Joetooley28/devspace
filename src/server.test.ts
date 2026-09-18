@@ -435,7 +435,9 @@ test("open_workspace advertises subagent instructions on demand by default", asy
 
   const opened = structuredContent(await callOpen(context.client, context.project, "chat-1"));
   const skills = opened.skills as Array<Record<string, unknown>>;
-  assert.equal(skills.some((skill) => skill.name === "subagents"), true);
+  const subagents = skills.find((skill) => skill.name === "subagents");
+  assert.ok(subagents);
+  assert.equal(subagents.path, "skills://subagents");
   assert.doesNotMatch(String(opened.instruction), /# DevSpace subagents/);
 });
 

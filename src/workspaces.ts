@@ -414,17 +414,8 @@ export class WorkspaceRegistry {
   }
 
   async resolveReadPath(workspace: Workspace, inputPath: string): Promise<WorkspaceReadPath> {
-    try {
-      return {
-        absolutePath: await this.resolvePath(workspace, inputPath),
-      };
-    } catch (workspaceError) {
-      const skillRead = resolveSkillReadPath(
-        workspace.skills,
-        inputPath,
-      );
-      if (!skillRead) throw workspaceError;
-
+    const skillRead = resolveSkillReadPath(workspace.skills, inputPath);
+    if (skillRead) {
       return {
         absolutePath: await resolveCanonicalAllowedPath(
           skillRead.absolutePath,
@@ -434,6 +425,10 @@ export class WorkspaceRegistry {
         skillRead,
       };
     }
+
+    return {
+      absolutePath: await this.resolvePath(workspace, inputPath),
+    };
   }
 
   async resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): Promise<string> {
