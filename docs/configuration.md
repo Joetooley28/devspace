@@ -114,6 +114,11 @@ DevSpace discovers standard Agent Skills from `~/.agents/skills`, project
 `skills.agentDir/skills` and each path in `skills.paths`. Relative custom paths
 are resolved from the active workspace.
 
+Discovered skills are exposed to MCP hosts through logical
+`skills://<name>` URIs instead of their filesystem locations. The bare URI
+loads the skill entry file; files bundled with a skill are addressed as
+`skills://<name>/<relative-path>`.
+
 When Subagents are enabled for MCP workspaces, DevSpace keeps its bundled
 `subagents` skill synchronized at `~/.devspace/skills/subagents/SKILL.md`.
 That managed copy is the authoritative `subagents` skill for DevSpace and is

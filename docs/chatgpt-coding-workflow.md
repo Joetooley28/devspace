@@ -136,12 +136,11 @@ before use.
 
 Legacy project paths such as `.pi/skills` can be added to `skills.paths` when needed.
 
-When `open_workspace` returns matching skills, the model should read the
-advertised `SKILL.md` before following that skill.
-
-Skill paths may be outside the workspace. DevSpace only permits reading:
-
-- files within advertised skill directories
+When `open_workspace` returns matching skills, the model reads the advertised
+`skills://<name>` URI before following that skill. The bare URI loads the
+skill entry file, while bundled resources use
+`skills://<name>/<relative-path>`. Physical skill paths stay internal to
+DevSpace.
 
 Set `skills.enabled` to `false` to hide skills from workspace output. Enable
 Subagents and choose providers through `devspace init` or the persisted provider
