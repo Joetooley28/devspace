@@ -18,14 +18,40 @@ class FakePiSession implements PiSessionLike {
   effort?: unknown;
   activeTools: string[] = [];
   toolHistory: string[][] = [];
+  compactCount = 0;
+  promptCount = 0;
+  compactOnFirstPrompt = false;
+
+  async compact(): Promise<any> {
+    this.compactCount += 1;
+    return { summary: "compacted" };
+  }
+
+  getContextUsage(): any {
+    return { tokens: 1_000, contextWindow: 222_222, percent: 0.5 };
+  }
 
   async prompt(text: string): Promise<void> {
-    const message = {
-      role: "assistant",
-      content: [{ type: "text", text: `response:${text}` }],
-    };
+    this.promptCount += 1;
+    const shouldCompact = this.compactOnFirstPrompt && this.promptCount === 1;
+    const message = shouldCompact
+      ? {
+          role: "assistant",
+          content: [{ type: "toolCall", name: "bash", arguments: {} }],
+          stopReason: "toolUse",
+          usage: { totalTokens: 200_000, input: 1_000, cacheRead: 198_000, output: 1_000 },
+        }
+      : {
+          role: "assistant",
+          content: [{ type: "text", text: `response:${text}` }],
+          stopReason: "stop",
+          usage: { totalTokens: 2_000, input: 1_000, cacheRead: 500, output: 500 },
+        };
     this.messages.push(message);
-    for (const listener of this.listeners) listener({ type: "agent_end" } as AgentSessionEvent);
+    for (const listener of this.listeners) {
+      listener({ type: "turn_end", message } as AgentSessionEvent);
+      listener({ type: "agent_end", messages: [message] } as AgentSessionEvent);
+    }
   }
 
   subscribe(listener: AgentSessionEventListener): () => void {
@@ -133,6 +159,24 @@ assert.equal(contexts.length, 2, "cold continuation creates a new AgentSession")
 assert.equal(contexts[1]?.providerSessionId, "pi_session_1");
 assert.deepEqual(sessions[1]?.activeTools, ["read", "grep", "find", "ls", "edit", "write", "bash"]);
 await pool.close();
+
+const compactingSession = new FakePiSession();
+compactingSession.compactOnFirstPrompt = true;
+const compactingDriver = new PiLocalAgentDriver(async () => compactingSession);
+const compactingRuntimeResult = await compactingDriver.createRuntime(context);
+assert.equal(compactingRuntimeResult.isOk(), true);
+if (compactingRuntimeResult.isErr()) throw compactingRuntimeResult.error;
+const compactingRun = await compactingRuntimeResult.value.run({
+  prompt: "long autonomous task",
+  workspaceRoot: "/tmp/project",
+  writeMode: "allowed",
+});
+assert.equal(compactingRun.isOk(), true);
+if (compactingRun.isErr()) throw compactingRun.error;
+assert.equal(compactingSession.compactCount, 1, "high-context tool turn triggers one Pi compaction");
+assert.equal(compactingSession.promptCount, 2, "DevSpace resumes Pi once after compaction");
+assert.match(compactingRun.value.finalResponse, /Continue the original delegated task from the compacted session state/);
+await compactingRuntimeResult.value.close();
 
 const missingModelSession = new FakePiSession();
 Object.defineProperty(missingModelSession, "modelRegistry", { value: { find: () => undefined } });

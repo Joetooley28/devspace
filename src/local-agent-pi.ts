@@ -26,6 +26,10 @@ const PI_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
 const PI_WORKSPACE_TOOLS = ["read", "grep", "find", "ls", "edit", "write", "bash"] as const;
 const PI_FULL_ACCESS_TOOLS = [...PI_WORKSPACE_TOOLS] as const;
 const MAX_PI_EVENTS = 10_000;
+const PI_COMPACTION_RESERVE_TOKENS = 32_768;
+const MAX_PI_COMPACTIONS_PER_RUN = 8;
+const PI_COMPACTION_CONTINUATION_PROMPT =
+  "Continue the original delegated task from the compacted session state. Do not restart completed work. Finish all pending requested deliverables, verify them, and return the final result.";
 
 export type PiSessionLike = Pick<
   AgentSession,
@@ -33,6 +37,8 @@ export type PiSessionLike = Pick<
   | "messages"
   | "modelRegistry"
   | "prompt"
+  | "compact"
+  | "getContextUsage"
   | "subscribe"
   | "setActiveToolsByName"
   | "setModel"
@@ -53,6 +59,9 @@ export class PiSessionRuntime implements LocalAgentRuntime {
   private closed = false;
   private collectingEvents = false;
   private events: unknown[] = [];
+  private contextGuardEnabled = false;
+  private compactionPromise: Promise<unknown> | undefined;
+  private compactionCount = 0;
 
   constructor(
     private readonly session: PiSessionLike,
@@ -61,6 +70,7 @@ export class PiSessionRuntime implements LocalAgentRuntime {
       if (!this.collectingEvents) return;
       if (this.events.length >= MAX_PI_EVENTS) this.events.shift();
       this.events.push(event);
+      this.maybeStartContextCompaction(event);
     });
   }
 
@@ -81,11 +91,23 @@ export class PiSessionRuntime implements LocalAgentRuntime {
         await callbacks?.onSessionId?.(this.session.sessionId);
         await this.applyOverrides(input);
         this.events = [];
+        this.compactionPromise = undefined;
+        this.compactionCount = 0;
         const messageStart = this.session.messages.length;
         this.collectingEvents = true;
+        this.contextGuardEnabled = true;
         try {
-          await this.session.prompt(input.prompt);
+          let prompt = input.prompt;
+          while (true) {
+            await this.session.prompt(prompt);
+            const compaction = this.compactionPromise;
+            if (!compaction) break;
+            await compaction;
+            this.compactionPromise = undefined;
+            prompt = PI_COMPACTION_CONTINUATION_PROMPT;
+          }
         } finally {
+          this.contextGuardEnabled = false;
           this.collectingEvents = false;
         }
         const currentMessages = this.session.messages.slice(messageStart);
@@ -138,6 +160,31 @@ export class PiSessionRuntime implements LocalAgentRuntime {
     } finally {
       this.session.dispose();
     }
+  }
+
+  private maybeStartContextCompaction(event: unknown): void {
+    if (!this.contextGuardEnabled || this.compactionPromise) return;
+    const eventRecord = asRecord(event);
+    if (eventRecord?.type !== "turn_end") return;
+    const message = asRecord(eventRecord.message);
+    if (!message || message.role !== "assistant" || message.stopReason === "stop") return;
+
+    const usage = asRecord(message.usage);
+    const contextTokens = typeof usage?.totalTokens === "number"
+      ? usage.totalTokens
+      : (typeof usage?.input === "number" ? usage.input : 0)
+        + (typeof usage?.cacheRead === "number" ? usage.cacheRead : 0)
+        + (typeof usage?.output === "number" ? usage.output : 0);
+    const contextWindow = this.session.getContextUsage()?.contextWindow ?? 0;
+    if (contextTokens <= 0 || contextWindow <= 0) return;
+    const threshold = Math.max(1, contextWindow - PI_COMPACTION_RESERVE_TOKENS);
+    if (contextTokens <= threshold) return;
+    if (this.compactionCount >= MAX_PI_COMPACTIONS_PER_RUN) return;
+
+    this.compactionCount += 1;
+    this.compactionPromise = this.session.compact(
+      "Preserve the original delegated task, investigation state, key evidence, exact file paths, pending deliverables, and remaining validation work. The harness will continue the same task after compaction.",
+    );
   }
 
   private async applyOverrides(input: LocalAgentRunInput): Promise<void> {
