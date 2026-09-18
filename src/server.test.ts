@@ -49,6 +49,24 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
   }
 });
 
+test("subagent MCP tools are exposed only when subagents are enabled", async (t) => {
+  const disabled = await fixture(t, { toolMode: "claude", uiEnabled: false });
+  const disabledTools = (await disabled.client.listTools()).tools.map((tool) => tool.name);
+  for (const name of ["start_subagent", "continue_subagent", "get_subagent", "list_subagents"]) {
+    assert.equal(disabledTools.includes(name), false);
+  }
+
+  const enabled = await fixture(t, {
+    toolMode: "claude",
+    uiEnabled: false,
+    localAgentProviders: [{ name: "codex", available: true }],
+  });
+  const enabledTools = (await enabled.client.listTools()).tools.map((tool) => tool.name);
+  for (const name of ["start_subagent", "continue_subagent", "get_subagent", "list_subagents"]) {
+    assert.equal(enabledTools.includes(name), true);
+  }
+});
+
 test("model-facing tool schemas use snake_case recursively", async (t) => {
   for (const toolMode of ["claude", "codex"] as const) {
     await t.test(toolMode, async (nested) => {

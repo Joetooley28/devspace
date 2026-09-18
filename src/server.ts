@@ -50,6 +50,7 @@ import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
   getLocalAgentProviderAvailabilitySnapshot,
 } from "./local-agent-availability.js";
+import { createLocalAgentClient } from "./local-agent-client.js";
 import {
   buildLocalAgentCatalog,
   buildLocalAgentProviderStatuses,
@@ -690,6 +691,10 @@ function registerMcpSurface(
     },
   );
 
+  if (config.subagents.enabled) {
+    registerLocalAgentTools(registrationTarget, config, workspaces);
+  }
+
   toolSurface.register({
     server: registrationTarget,
     config,
@@ -791,6 +796,208 @@ function withTrackedToolHandlers(
 
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+}
+
+function registerLocalAgentTools(
+  server: McpRegistrationTarget,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+): void {
+  const client = createLocalAgentClient(config);
+  const agentRecordSchema = {
+    agent_id: z.string(),
+    workspace_id: z.string().optional(),
+    workspace_root: z.string(),
+    profile_name: z.string(),
+    provider: z.string(),
+    model: z.string().optional(),
+    effort: z.string().optional(),
+    provider_session_id: z.string().optional(),
+    status: z.enum(["starting", "running", "idle", "error", "stopped"]),
+    latest_response: z.string().optional(),
+    error: z.string().optional(),
+    error_code: z.string().optional(),
+    error_retryable: z.boolean().optional(),
+    created_at: z.string(),
+    updated_at: z.string(),
+  };
+
+  const present = (record: {
+    id: string;
+    workspaceId?: string;
+    workspaceRoot: string;
+    profileName: string;
+    provider: string;
+    model?: string;
+    effort?: string;
+    providerSessionId?: string;
+    status: "starting" | "running" | "idle" | "error" | "stopped";
+    latestResponse?: string;
+    error?: string;
+    errorCode?: string;
+    errorRetryable?: boolean;
+    createdAt: string;
+    updatedAt: string;
+  }) => ({
+    agent_id: record.id,
+    workspace_id: record.workspaceId,
+    workspace_root: record.workspaceRoot,
+    profile_name: record.profileName,
+    provider: record.provider,
+    model: record.model,
+    effort: record.effort,
+    provider_session_id: record.providerSessionId,
+    status: record.status,
+    latest_response: record.latestResponse,
+    error: record.error,
+    error_code: record.errorCode,
+    error_retryable: record.errorRetryable,
+    created_at: record.createdAt,
+    updated_at: record.updatedAt,
+  });
+
+  const fail = (error: unknown) => {
+    const detail = error as { code?: unknown; retryable?: unknown };
+    const message = error instanceof Error ? error.message : String(error);
+    const code = typeof detail.code === "string" ? detail.code : "SUBAGENT_ERROR";
+    const retryable = detail.retryable === true;
+    return {
+      content: [textBlock(code + ": " + message)],
+      isError: true,
+      structuredContent: { error: message, error_code: code, error_retryable: retryable },
+    };
+  };
+
+  server.registerTool(
+    "start_subagent",
+    {
+      title: "Start subagent",
+      description:
+        "Start one persistent DevSpace subagent in an already-open workspace. Use this instead of invoking devspace agents run through bash. Returns immediately with a durable agent_id; use get_subagent to observe progress and continue_subagent for follow-up turns.",
+      inputSchema: {
+        workspace_id: z.string().describe(workspaceIdDescription),
+        target: z.string().describe("Enabled subagent profile or provider name, for example local-qwen38, pi, or cursor."),
+        prompt: z.string().min(1).describe("Self-contained task for the subagent."),
+        model: z.string().optional().describe("Optional explicit model override."),
+        effort: z.string().optional().describe("Optional explicit reasoning-effort override."),
+        write_mode: z.enum(["read_only", "allowed", "full_access"]).optional().describe("Provider write permission mode. Defaults to allowed."),
+      },
+      outputSchema: agentRecordSchema,
+      annotations: { readOnlyHint: false, idempotentHint: false },
+    },
+    async ({ workspace_id, target, prompt, model, effort, write_mode }) => {
+      const startedAt = performance.now();
+      const workspace = await workspaces.getWorkspace(workspace_id);
+      const result = await client.start({
+        target,
+        prompt,
+        workspaceRoot: workspace.root,
+        workspaceId: workspace.id,
+        model,
+        effort,
+        writeMode: write_mode,
+      });
+      if (result.isErr()) return fail(result.error);
+      logToolCall(config, {
+        tool: "start_subagent",
+        workspaceId: workspace.id,
+        path: workspace.root,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      const record = present(result.value);
+      return {
+        content: [textBlock("Started persistent subagent " + record.agent_id + " (" + record.profile_name + ", " + record.provider + "); status=" + record.status + ".")],
+        structuredContent: record,
+      };
+    },
+  );
+
+  server.registerTool(
+    "continue_subagent",
+    {
+      title: "Continue subagent",
+      description: "Send a follow-up turn to an existing persistent DevSpace subagent in the same workspace. Reuses the provider session when available.",
+      inputSchema: {
+        workspace_id: z.string().describe(workspaceIdDescription),
+        agent_id: z.string().describe("Durable DevSpace agent id returned by start_subagent."),
+        prompt: z.string().min(1).describe("Follow-up task or instruction."),
+        model: z.string().optional().describe("Optional explicit model override."),
+        effort: z.string().optional().describe("Optional explicit reasoning-effort override."),
+        write_mode: z.enum(["read_only", "allowed", "full_access"]).optional().describe("Optional write permission override."),
+      },
+      outputSchema: agentRecordSchema,
+      annotations: { readOnlyHint: false, idempotentHint: false },
+    },
+    async ({ workspace_id, agent_id, prompt, model, effort, write_mode }) => {
+      const startedAt = performance.now();
+      const workspace = await workspaces.getWorkspace(workspace_id);
+      const result = await client.continue(
+        agent_id,
+        prompt,
+        { model, effort, writeMode: write_mode },
+        { workspaceId: workspace.id, workspaceRoot: workspace.root },
+      );
+      if (result.isErr()) return fail(result.error);
+      logToolCall(config, {
+        tool: "continue_subagent",
+        workspaceId: workspace.id,
+        path: workspace.root,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      const record = present(result.value);
+      return {
+        content: [textBlock("Continued subagent " + record.agent_id + "; status=" + record.status + ".")],
+        structuredContent: record,
+      };
+    },
+  );
+
+  server.registerTool(
+    "get_subagent",
+    {
+      title: "Get subagent",
+      description: "Read the current state of one persistent DevSpace subagent without starting or retrying work. Safe for checking whether a launch actually happened after a lost response.",
+      inputSchema: {
+        workspace_id: z.string().describe(workspaceIdDescription),
+        agent_id: z.string().describe("Durable DevSpace agent id."),
+      },
+      outputSchema: agentRecordSchema,
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ workspace_id, agent_id }) => {
+      const workspace = await workspaces.getWorkspace(workspace_id);
+      const result = await client.get(agent_id, { workspaceId: workspace.id, workspaceRoot: workspace.root });
+      if (result.isErr()) return fail(result.error);
+      const record = present(result.value);
+      return {
+        content: [textBlock("Subagent " + record.agent_id + ": status=" + record.status + ".")],
+        structuredContent: record,
+      };
+    },
+  );
+
+  server.registerTool(
+    "list_subagents",
+    {
+      title: "List subagents",
+      description: "List persistent DevSpace subagents scoped to an already-open workspace. This is read-only and is the preferred duplicate-safety check before retrying a launch after a lost response.",
+      inputSchema: { workspace_id: z.string().describe(workspaceIdDescription) },
+      outputSchema: { agents: z.array(z.object(agentRecordSchema)) },
+      annotations: { readOnlyHint: true, idempotentHint: true },
+    },
+    async ({ workspace_id }) => {
+      const workspace = await workspaces.getWorkspace(workspace_id);
+      const result = await client.list({ workspaceId: workspace.id, workspaceRoot: workspace.root });
+      if (result.isErr()) return fail(result.error);
+      const agents = result.value.map(present);
+      return {
+        content: [textBlock("Found " + agents.length + " persistent subagent(s) in this workspace.")],
+        structuredContent: { agents },
+      };
+    },
+  );
 }
 
 export function createServer(
