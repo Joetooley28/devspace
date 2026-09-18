@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { createServer as createNetServer } from "node:net";
+import { relative, resolve } from "node:path";
 import type {
   OpencodeClient,
   PermissionConfig,
@@ -21,7 +22,7 @@ import type {
 import { terminateProcessTree } from "./process-platform.js";
 
 const OPENCODE_SERVER_HOSTNAME = "127.0.0.1";
-const OPENCODE_SERVER_START_TIMEOUT_MS = 5_000;
+const OPENCODE_SERVER_START_TIMEOUT_MS = 15_000;
 const OPENCODE_SERVER_START_ATTEMPTS = 3;
 const OPENCODE_PROMPT_TIMEOUT_MS = 5 * 60_000;
 const require = createRequire(import.meta.url);
@@ -44,6 +45,7 @@ export type OpencodeFactory = (
 ) => Promise<{
   client: OpencodeClientLike;
   server: OpencodeServerLike;
+  workspaceRoot?: string;
 }>;
 
 export class OpencodeRuntime implements LocalAgentRuntime {
@@ -56,6 +58,7 @@ export class OpencodeRuntime implements LocalAgentRuntime {
     private readonly client: OpencodeClientLike,
     private readonly server: OpencodeServerLike,
     private readonly promptTimeoutMs = OPENCODE_PROMPT_TIMEOUT_MS,
+    private readonly providerWorkspaceRoot?: string,
   ) {}
 
   async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks) {
@@ -74,9 +77,12 @@ export class OpencodeRuntime implements LocalAgentRuntime {
         }
         try {
           await assertOpencodeHealthy(this.client);
-          const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input);
+          const providerInput = this.providerWorkspaceRoot
+            ? { ...input, workspaceRoot: this.providerWorkspaceRoot }
+            : input;
+          const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, providerInput);
           await callbacks?.onSessionId?.(sessionId);
-          const promptResult = await this.prompt(sessionId, input);
+          const promptResult = await this.prompt(sessionId, providerInput);
           assertOpenCodePromptSucceeded(promptResult);
           const finalResponse = requireFinalResponse(extractOpenCodeFinalResponse(promptResult));
           return {
@@ -156,8 +162,11 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
     private readonly env: NodeJS.ProcessEnv = process.env,
   ) {}
 
-  runtimeKey(_context: LocalAgentRuntimeContext): string {
-    return "opencode:default";
+  runtimeKey(context: LocalAgentRuntimeContext): string {
+    const remote = resolveExternalOpencodeTarget(context.workspaceRoot, this.env);
+    return remote
+      ? `opencode:remote:${remote.baseUrl}:${remote.workspaceRoot}`
+      : `opencode:local:${resolve(context.workspaceRoot)}`;
   }
 
   async createRuntime(context: LocalAgentRuntimeContext) {
@@ -166,18 +175,68 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
       agentId: context.agentId,
       operation: "create_runtime",
       run: async (): Promise<LocalAgentRuntime> => {
-        const { client, server } = await this.factory(context, this.env);
-        return new OpencodeRuntime(client, server);
+        const { client, server, workspaceRoot } = await this.factory(context, this.env);
+        return new OpencodeRuntime(client, server, OPENCODE_PROMPT_TIMEOUT_MS, workspaceRoot);
       },
     });
   }
 }
 
-async function defaultOpencodeFactory(
-  _context?: LocalAgentRuntimeContext,
+interface ExternalOpencodeTarget {
+  baseUrl: string;
+  workspaceRoot: string;
+}
+
+export function resolveExternalOpencodeTarget(
+  workspaceRoot: string,
   env: NodeJS.ProcessEnv = process.env,
-): Promise<{ client: OpencodeClientLike; server: OpencodeServerLike }> {
+): ExternalOpencodeTarget | undefined {
+  const baseUrl = env.DEVSPACE_OPENCODE_REMOTE_URL?.trim().replace(/\/+$/, "");
+  const mappingSource = env.DEVSPACE_OPENCODE_REMOTE_WORKSPACE_MAP?.trim();
+  if (!baseUrl || !mappingSource) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(mappingSource);
+  } catch (error) {
+    throw new Error(`DEVSPACE_OPENCODE_REMOTE_WORKSPACE_MAP must be valid JSON: ${errorMessage(error)}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("DEVSPACE_OPENCODE_REMOTE_WORKSPACE_MAP must be a JSON object.");
+  }
+
+  const localRoot = resolve(workspaceRoot);
+  const matches = Object.entries(parsed as Record<string, unknown>)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim().length > 0)
+    .map(([localPrefix, remotePrefix]) => ({
+      localPrefix: resolve(localPrefix),
+      remotePrefix: remotePrefix.trim(),
+    }))
+    .filter(({ localPrefix }) => localRoot === localPrefix || localRoot.startsWith(`${localPrefix}/`))
+    .sort((left, right) => right.localPrefix.length - left.localPrefix.length);
+
+  const match = matches[0];
+  if (!match) return undefined;
+  const suffix = relative(match.localPrefix, localRoot);
+  const remoteRoot = suffix
+    ? `${match.remotePrefix.replace(/\/+$/, "")}/${suffix.replaceAll("\\", "/")}`
+    : match.remotePrefix;
+  return { baseUrl, workspaceRoot: remoteRoot };
+}
+
+async function defaultOpencodeFactory(
+  context?: LocalAgentRuntimeContext,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ client: OpencodeClientLike; server: OpencodeServerLike; workspaceRoot?: string }> {
   const { createOpencodeClient } = await import("@opencode-ai/sdk/v2");
+  const remote = context ? resolveExternalOpencodeTarget(context.workspaceRoot, env) : undefined;
+  if (remote) {
+    return {
+      client: createOpencodeClient({ baseUrl: remote.baseUrl }),
+      server: { close: () => undefined },
+      workspaceRoot: remote.workspaceRoot,
+    };
+  }
   const config = {
     agent: {
       devspace_read_only: opencodeAgentConfig("read_only"),

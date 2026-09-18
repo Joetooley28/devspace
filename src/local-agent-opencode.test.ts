@@ -8,6 +8,7 @@ import {
   OpencodeRuntime,
   opencodeAgentFor,
   opencodePermissionFor,
+  resolveExternalOpencodeTarget,
   type OpencodeClientLike,
   type OpencodeFactory,
 } from "./local-agent-opencode.js";
@@ -53,6 +54,28 @@ const factory: OpencodeFactory = async (_context, env) => {
     server: { close: () => { closeCalls += 1; } },
   };
 };
+assert.deepEqual(
+  resolveExternalOpencodeTarget("/home/ai/code/local-ai-2x5090/benchmarks/run", {
+    DEVSPACE_OPENCODE_REMOTE_URL: "http://100.123.105.97:4098/",
+    DEVSPACE_OPENCODE_REMOTE_WORKSPACE_MAP: JSON.stringify({
+      "/home/ai/code/local-ai-2x5090": "/data/linux-fast/projects/local-ai-2x5090",
+    }),
+  }),
+  {
+    baseUrl: "http://100.123.105.97:4098",
+    workspaceRoot: "/data/linux-fast/projects/local-ai-2x5090/benchmarks/run",
+  },
+);
+assert.equal(
+  resolveExternalOpencodeTarget("/home/ai/code/ai-hub-vps", {
+    DEVSPACE_OPENCODE_REMOTE_URL: "http://100.123.105.97:4098",
+    DEVSPACE_OPENCODE_REMOTE_WORKSPACE_MAP: JSON.stringify({
+      "/home/ai/code/local-ai-2x5090": "/data/linux-fast/projects/local-ai-2x5090",
+    }),
+  }),
+  undefined,
+);
+
 const driver = new OpencodeLocalAgentDriver(factory, { HARNESS_ENV: "opencode" });
 const pool = new LocalAgentRuntimePool();
 
