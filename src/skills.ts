@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   loadSkills,
@@ -29,6 +29,7 @@ export interface SkillReadResolution {
   skill: Skill;
 }
 
+const SKILL_URI_PREFIX = "skills://";
 const SUBAGENTS_SKILL_NAME = "subagents";
 const SUBAGENTS_SKILL = join(SUBAGENTS_SKILL_NAME, "SKILL.md");
 
@@ -139,33 +140,39 @@ export function resolveSkillReadPath(
   skills: Skill[],
   inputPath: string,
 ): SkillReadResolution | undefined {
-  const absolutePath = resolve(expandHomePath(inputPath));
+  if (!inputPath.startsWith(SKILL_URI_PREFIX)) return undefined;
 
-  for (const skill of skills) {
-    const skillFilePath = resolve(skill.filePath);
-    if (absolutePath === skillFilePath) {
-      return { absolutePath, skill };
-    }
+  const skillReference = inputPath.slice(SKILL_URI_PREFIX.length);
+  const separatorIndex = skillReference.indexOf("/");
+  const skillName = separatorIndex === -1
+    ? skillReference
+    : skillReference.slice(0, separatorIndex);
+  const resourcePath = separatorIndex === -1
+    ? undefined
+    : skillReference.slice(separatorIndex + 1);
+
+  if (!skillName) {
+    throw new Error(`Invalid skill URI: ${inputPath}`);
   }
 
-  for (const skill of skills) {
-    const baseDir = resolve(skill.baseDir);
-    if (!isPathInsideRoot(absolutePath, baseDir)) continue;
-
-    return { absolutePath, skill };
+  const skill = skills.find((candidate) => candidate.name === skillName);
+  if (!skill) {
+    throw new Error(`Unknown skill: ${skillName}`);
   }
 
-  return undefined;
+  if (!resourcePath) {
+    return { absolutePath: resolve(skill.filePath), skill };
+  }
+
+  const baseDir = resolve(skill.baseDir);
+  const absolutePath = resolve(baseDir, resourcePath);
+  if (!isPathInsideRoot(absolutePath, baseDir)) {
+    throw new Error(`Skill resource is outside skill directory: ${inputPath}`);
+  }
+
+  return { absolutePath, skill };
 }
 
-export function formatPathForPrompt(path: string): string {
-  const home = resolve(homedir());
-  const resolvedPath = resolve(path);
-
-  if (resolvedPath === home) return "~";
-  if (resolvedPath.startsWith(`${home}${sep}`)) {
-    return `~/${resolvedPath.slice(home.length + 1).split(sep).join("/")}`;
-  }
-
-  return resolvedPath.split(sep).join("/");
+export function formatSkillUri(skill: Skill): string {
+  return `${SKILL_URI_PREFIX}${skill.name}`;
 }

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { loadConfig } from "./config.js";
 import {
   effectiveSkillPaths,
-  formatPathForPrompt,
+  formatSkillUri,
   loadWorkspaceSkills,
   resolveSkillReadPath,
 } from "./skills.js";
@@ -247,14 +247,32 @@ try {
 
   const projectSkill = loaded.skills.find((skill) => skill.name === "agent-project-skill");
   assert.ok(projectSkill);
-  assert.match(formatPathForPrompt(projectSkill.filePath), /SKILL\.md$/);
+  assert.equal(formatSkillUri(projectSkill), "skills://agent-project-skill");
 
-  const skillFileRead = resolveSkillReadPath(loaded.skills, projectSkill.filePath);
+  const skillFileRead = resolveSkillReadPath(
+    loaded.skills,
+    "skills://agent-project-skill",
+  );
   assert.equal(skillFileRead?.absolutePath, projectSkill.filePath);
 
   const resourcePath = join(projectSkill.baseDir, "references.md");
   await writeFile(resourcePath, "reference\n");
-  assert.equal(resolveSkillReadPath(loaded.skills, resourcePath)?.absolutePath, resourcePath);
+  assert.equal(
+    resolveSkillReadPath(
+      loaded.skills,
+      "skills://agent-project-skill/references.md",
+    )?.absolutePath,
+    resourcePath,
+  );
+  assert.equal(resolveSkillReadPath(loaded.skills, projectSkill.filePath), undefined);
+  assert.throws(
+    () => resolveSkillReadPath(loaded.skills, "skills://missing"),
+    /Unknown skill/,
+  );
+  assert.throws(
+    () => resolveSkillReadPath(loaded.skills, "skills://agent-project-skill/../secret"),
+    /outside skill directory/,
+  );
 } finally {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;
