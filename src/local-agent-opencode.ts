@@ -11,6 +11,7 @@ import {
   AgentProviderUnavailableError,
   captureAgentProviderResult,
 } from "./local-agent-errors.js";
+import { Agent as UndiciAgent, fetch as undiciFetch } from "undici";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
@@ -38,6 +39,46 @@ export type OpencodeClientLike = Pick<OpencodeClient, "global" | "session">;
 
 export interface OpencodeServerLike {
   close(): void;
+}
+
+export interface OpencodeHttpTransport {
+  fetch: typeof fetch;
+  close(): void;
+}
+
+export interface OpencodeHttpTransportOptions {
+  headersTimeoutMs?: number;
+  bodyTimeoutMs?: number;
+}
+
+export function createOpencodeHttpTransport(
+  options: OpencodeHttpTransportOptions = {},
+): OpencodeHttpTransport {
+  const dispatcher = new UndiciAgent({
+    headersTimeout: options.headersTimeoutMs ?? 0,
+    bodyTimeout: options.bodyTimeoutMs ?? 0,
+  });
+  const fetchImpl = (async (request: Request) => {
+    const method = request.method.toUpperCase();
+    const body = method === "GET" || method === "HEAD" || request.body === null
+      ? undefined
+      : new Uint8Array(await request.arrayBuffer());
+    const response = await undiciFetch(request.url, {
+      method,
+      headers: Object.fromEntries(request.headers.entries()),
+      body,
+      redirect: request.redirect,
+      signal: request.signal,
+      dispatcher,
+    });
+    return response as unknown as Response;
+  }) as typeof fetch;
+  return {
+    fetch: fetchImpl,
+    close: () => {
+      void dispatcher.close();
+    },
+  };
 }
 
 export type OpencodeFactory = (
@@ -253,9 +294,13 @@ async function defaultOpencodeFactory(
   const { createOpencodeClient } = await import("@opencode-ai/sdk/v2");
   const remote = context ? resolveExternalOpencodeTarget(context.workspaceRoot, env) : undefined;
   if (remote) {
+    const transport = createOpencodeHttpTransport();
     return {
-      client: createOpencodeClient({ baseUrl: remote.baseUrl }),
-      server: { close: () => undefined },
+      client: createOpencodeClient({
+        baseUrl: remote.baseUrl,
+        fetch: transport.fetch,
+      }),
+      server: { close: transport.close },
       workspaceRoot: remote.workspaceRoot,
     };
   }
@@ -267,9 +312,18 @@ async function defaultOpencodeFactory(
     },
   };
   const server = await startOpencodeServer(env, config);
+  const transport = createOpencodeHttpTransport();
   return {
-    client: createOpencodeClient({ baseUrl: server.url }),
-    server,
+    client: createOpencodeClient({
+      baseUrl: server.url,
+      fetch: transport.fetch,
+    }),
+    server: {
+      close: () => {
+        transport.close();
+        server.close();
+      },
+    },
   };
 }
 

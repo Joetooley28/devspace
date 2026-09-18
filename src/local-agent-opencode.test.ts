@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  createOpencodeHttpTransport,
   opencodeAgentConfig,
   OpencodeLocalAgentDriver,
   OpencodeRuntime,
@@ -86,6 +88,46 @@ assert.throws(
   () => resolveOpencodePromptTimeoutMs({ DEVSPACE_OPENCODE_PROMPT_TIMEOUT_MS: "-1" }),
   /must be an integer from 0/,
 );
+
+const transportServer = createServer((_request, response) => {
+  setTimeout(() => {
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.end("ok");
+  }, 2_500);
+});
+await new Promise<void>((resolve, reject) => {
+  transportServer.once("error", reject);
+  transportServer.listen(0, "127.0.0.1", () => resolve());
+});
+try {
+  const address = transportServer.address();
+  assert.ok(address && typeof address === "object");
+  const url = `http://127.0.0.1:${address.port}/slow-headers`;
+
+  const shortTransport = createOpencodeHttpTransport({ headersTimeoutMs: 500 });
+  try {
+    await assert.rejects(
+      shortTransport.fetch(new Request(url)),
+      (error: unknown) => (
+        error instanceof TypeError
+        && (error.cause as { code?: string } | undefined)?.code === "UND_ERR_HEADERS_TIMEOUT"
+      ),
+      "Undici exposes delayed response headers as the same TypeError seen in the AP047 parent failure",
+    );
+  } finally {
+    shortTransport.close();
+  }
+
+  const noTimeoutTransport = createOpencodeHttpTransport();
+  try {
+    const response = await noTimeoutTransport.fetch(new Request(url));
+    assert.equal(await response.text(), "ok", "zero headers/body timeouts allow a long-running request to complete");
+  } finally {
+    noTimeoutTransport.close();
+  }
+} finally {
+  await new Promise<void>((resolve) => transportServer.close(() => resolve()));
+}
 
 const noTimeoutClient = {
   global: {
