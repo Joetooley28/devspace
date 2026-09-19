@@ -109,7 +109,7 @@ export function textBlock(text: string): ToolContent {
 }
 
 const SKILL_URI_SHELL_ARGUMENT =
-  /"(skills:\/\/[^"\r\n]+)"|'(skills:\/\/[^'\r\n]+)'|(skills:\/\/[^\s"'\`|&;()<>]+)/g;
+  /"(skills:\/\/[^"\r\n]+)"|'(skills:\/\/[^'\r\n]+)'|(?<![^\s|&;()<>])(skills:\/\/[^\s"'\`|&;()<>]+)/g;
 
 export async function expandSkillUrisInShellCommand(
   config: ServerConfig,

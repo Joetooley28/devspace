@@ -481,6 +481,15 @@ test("experimental skill URIs work as shell command arguments", async (t) => {
       }));
 
       assert.match(String(result.result), /# DevSpace subagents/);
+
+      const literalCommand = `node -p "process.argv[1]" "prefixskills://subagents"`;
+      const literal = structuredContent(await context.client.callTool({
+        name: toolMode === "codex" ? "exec_command" : "bash",
+        arguments: toolMode === "codex"
+          ? { workspace_id: workspaceId, cmd: literalCommand }
+          : { workspace_id: workspaceId, command: literalCommand },
+      }));
+      assert.match(String(literal.result), /prefixskills:\/\/subagents/);
     });
   }
 });
