@@ -118,6 +118,8 @@ By default, discovered skills keep their filesystem paths for compatibility
 with existing MCP hosts. Set `DEVSPACE_EXPERIMENTAL_SKILL_URIS=1` to expose
 logical `skills://<name>` URIs instead. The bare URI loads the skill entry
 file; bundled resources use `skills://<name>/<relative-path>`.
+As an experimental compatibility workaround, standalone skill URI arguments in
+the shell tools are resolved to their local files immediately before execution.
 
 Skill URIs are experimental and may be removed in favor of the MCP Skills
 extension as host support matures.

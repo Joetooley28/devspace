@@ -455,6 +455,36 @@ test("open_workspace advertises experimental skill URIs when enabled", async (t)
   assert.doesNotMatch(String(opened.instruction), /# DevSpace subagents/);
 });
 
+test("experimental skill URIs work as shell command arguments", async (t) => {
+  for (const toolMode of ["codex", "claude"] as const) {
+    await t.test(toolMode, async (t) => {
+      const context = await fixture(t, {
+        toolMode,
+        localAgentProviders: [{ name: "codex", available: true }],
+        experimentalSkillUris: true,
+      });
+      const workspaceId = structuredContent(
+        await callOpen(context.client, context.project, `skill-shell-${toolMode}`),
+      ).workspace_id;
+      assert.equal(typeof workspaceId, "string");
+
+      const skillArgument = toolMode === "codex"
+        ? "skills://subagents"
+        : '"skills://subagents"';
+      const command =
+        `node -p "require('node:fs').readFileSync(process.argv[1],'utf8')" ${skillArgument}`;
+      const result = structuredContent(await context.client.callTool({
+        name: toolMode === "codex" ? "exec_command" : "bash",
+        arguments: toolMode === "codex"
+          ? { workspace_id: workspaceId, cmd: command }
+          : { workspace_id: workspaceId, command },
+      }));
+
+      assert.match(String(result.result), /# DevSpace subagents/);
+    });
+  }
+});
+
 test("open_workspace preloads subagent instructions when configured", async (t) => {
   const context = await fixture(t, {
     localAgentProviders: [{ name: "codex", available: true }],
