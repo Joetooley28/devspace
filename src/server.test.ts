@@ -437,6 +437,20 @@ test("open_workspace advertises subagent instructions on demand by default", asy
   const skills = opened.skills as Array<Record<string, unknown>>;
   const subagents = skills.find((skill) => skill.name === "subagents");
   assert.ok(subagents);
+  assert.match(String(subagents.path), /\/skills\/subagents\/SKILL\.md$/);
+  assert.doesNotMatch(String(opened.instruction), /# DevSpace subagents/);
+});
+
+test("open_workspace advertises experimental skill URIs when enabled", async (t) => {
+  const context = await fixture(t, {
+    localAgentProviders: [{ name: "codex", available: true }],
+    experimentalSkillUris: true,
+  });
+
+  const opened = structuredContent(await callOpen(context.client, context.project, "chat-1"));
+  const skills = opened.skills as Array<Record<string, unknown>>;
+  const subagents = skills.find((skill) => skill.name === "subagents");
+  assert.ok(subagents);
   assert.equal(subagents.path, "skills://subagents");
   assert.doesNotMatch(String(opened.instruction), /# DevSpace subagents/);
 });
@@ -724,6 +738,7 @@ async function fixture(
     subagents?: SubagentsConfig;
     toolMode?: ToolMode;
     uiEnabled?: boolean;
+    experimentalSkillUris?: boolean;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -756,7 +771,7 @@ async function fixture(
   const initialProviderAvailability = typeof options.localAgentProviders === "function"
     ? options.localAgentProviders()
     : options.localAgentProviders ?? [];
-  const loadedConfig = loadConfig(writeTestDevspaceConfig(join(root, ".config"), {
+  const configEnv = writeTestDevspaceConfig(join(root, ".config"), {
     server: { port: 1 },
     workspaces: { allowedRoots: [root], worktreeRoot: join(root, ".worktrees") },
     skills: { agentDir },
@@ -765,7 +780,13 @@ async function fixture(
       instructions: "on-demand",
       providers: [],
     },
-  }));
+  });
+  const loadedConfig = loadConfig({
+    ...configEnv,
+    ...(options.experimentalSkillUris
+      ? { DEVSPACE_EXPERIMENTAL_SKILL_URIS: "1" }
+      : {}),
+  });
   const modeConfig: ServerConfig = {
     ...loadedConfig,
     toolMode: options.toolMode ?? loadedConfig.toolMode,

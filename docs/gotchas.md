@@ -260,9 +260,9 @@ Copy or adapt them into one of the active profile directories before use.
 
 Legacy project paths such as `.pi/skills` can be added to `skills.paths` when needed.
 
-If a skill appears in `open_workspace`, the model reads its advertised
-`skills://<name>` URI before following it. The bare URI resolves to the
-skill's entry file; resources within that skill use
+If a skill appears in `open_workspace`, the model reads its advertised path
+before following it. With `DEVSPACE_EXPERIMENTAL_SKILL_URIS=1`, DevSpace
+instead advertises `skills://<name>`; bundled resources use
 `skills://<name>/<relative-path>`.
 
 ## Review Card Does Not Appear

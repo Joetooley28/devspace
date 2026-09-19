@@ -344,7 +344,7 @@ test("workspace cache evicts old contexts without losing advertised skill reads"
   );
   await writeFile(resourceFile, "reference\n");
 
-  const config = loadConfig(writeTestDevspaceConfig(
+  const configEnv = writeTestDevspaceConfig(
     join(context.root, ".bounded-home"),
     {
       server: { port: 1 },
@@ -355,7 +355,11 @@ test("workspace cache evicts old contexts without losing advertised skill reads"
       skills: { agentDir },
       subagents: { enabled: true, instructions: "on-demand", providers: [] },
     },
-  ));
+  );
+  const config = loadConfig({
+    ...configEnv,
+    DEVSPACE_EXPERIMENTAL_SKILL_URIS: "1",
+  });
 
   const store = new SqliteWorkspaceStore(stateDir);
   try {

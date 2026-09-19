@@ -114,10 +114,13 @@ DevSpace discovers standard Agent Skills from `~/.agents/skills`, project
 `skills.agentDir/skills` and each path in `skills.paths`. Relative custom paths
 are resolved from the active workspace.
 
-Discovered skills are exposed to MCP hosts through logical
-`skills://<name>` URIs instead of their filesystem locations. The bare URI
-loads the skill entry file; files bundled with a skill are addressed as
-`skills://<name>/<relative-path>`.
+By default, discovered skills keep their filesystem paths for compatibility
+with existing MCP hosts. Set `DEVSPACE_EXPERIMENTAL_SKILL_URIS=1` to expose
+logical `skills://<name>` URIs instead. The bare URI loads the skill entry
+file; bundled resources use `skills://<name>/<relative-path>`.
+
+Skill URIs are experimental and may be removed in favor of the MCP Skills
+extension as host support matures.
 
 When Subagents are enabled for MCP workspaces, DevSpace keeps its bundled
 `subagents` skill synchronized at `~/.devspace/skills/subagents/SKILL.md`.

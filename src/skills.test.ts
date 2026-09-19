@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { loadConfig } from "./config.js";
 import {
   effectiveSkillPaths,
+  formatPathForPrompt,
   formatSkillUri,
   loadWorkspaceSkills,
   resolveSkillReadPath,
@@ -181,14 +182,22 @@ try {
   }));
   assert.deepEqual(loadWorkspaceSkills(disabledConfig, projectRoot).skills, []);
 
-  const config = loadConfig(writeTestDevspaceConfig(configDir, {
+  const configEnv = writeTestDevspaceConfig(configDir, {
     server: { port: 1 },
     workspaces: { allowedRoots: [projectRoot] },
     skills: {
       agentDir,
       paths: [explicitSkills, "~/.claude/skills", "./.claude/skills"],
     },
-  }));
+  });
+  const defaultConfig = loadConfig(configEnv);
+  const defaultLoaded = loadWorkspaceSkills(defaultConfig, projectRoot);
+  assert.equal(defaultLoaded.skills.some((skill) => skill.name === "foo/bar"), true);
+
+  const config = loadConfig({
+    ...configEnv,
+    DEVSPACE_EXPERIMENTAL_SKILL_URIS: "1",
+  });
   const loaded = loadWorkspaceSkills(config, projectRoot);
   assert.equal(loaded.skills.some((skill) => skill.name === "agent-global-skill"), true);
   assert.equal(loaded.skills.some((skill) => skill.name === "agent-project-skill"), true);
@@ -266,6 +275,20 @@ try {
 
   const projectSkill = loaded.skills.find((skill) => skill.name === "agent-project-skill");
   assert.ok(projectSkill);
+  const defaultProjectSkill = defaultLoaded.skills.find(
+    (skill) => skill.name === "agent-project-skill",
+  );
+  assert.ok(defaultProjectSkill);
+  assert.match(formatPathForPrompt(defaultProjectSkill.filePath), /SKILL\.md$/);
+  assert.equal(
+    resolveSkillReadPath(defaultLoaded.skills, defaultProjectSkill.filePath, false)?.absolutePath,
+    defaultProjectSkill.filePath,
+  );
+  assert.equal(
+    resolveSkillReadPath(defaultLoaded.skills, "skills://agent-project-skill", false),
+    undefined,
+  );
+
   assert.equal(formatSkillUri(projectSkill), "skills://agent-project-skill");
   assert.throws(
     () => formatSkillUri({ ...projectSkill, name: "foo/bar" }),
@@ -275,6 +298,7 @@ try {
   const skillFileRead = resolveSkillReadPath(
     loaded.skills,
     "skills://agent-project-skill",
+    true,
   );
   assert.equal(skillFileRead?.absolutePath, projectSkill.filePath);
 
@@ -284,20 +308,25 @@ try {
     resolveSkillReadPath(
       loaded.skills,
       "skills://agent-project-skill/references.md",
+      true,
     )?.absolutePath,
     resourcePath,
   );
-  assert.equal(resolveSkillReadPath(loaded.skills, projectSkill.filePath), undefined);
+  assert.equal(resolveSkillReadPath(loaded.skills, projectSkill.filePath, true), undefined);
   assert.throws(
-    () => resolveSkillReadPath(loaded.skills, "skills://missing"),
+    () => resolveSkillReadPath(loaded.skills, "skills://missing", true),
     /Unknown skill/,
   );
   assert.throws(
-    () => resolveSkillReadPath(loaded.skills, "skills://foo%2Fbar"),
+    () => resolveSkillReadPath(loaded.skills, "skills://foo%2Fbar", true),
     /Invalid skill URI/,
   );
   assert.throws(
-    () => resolveSkillReadPath(loaded.skills, "skills://agent-project-skill/../secret"),
+    () => resolveSkillReadPath(
+      loaded.skills,
+      "skills://agent-project-skill/../secret",
+      true,
+    ),
     /outside skill directory/,
   );
 } finally {

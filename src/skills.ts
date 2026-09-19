@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   loadSkills,
@@ -111,11 +111,13 @@ export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSk
   });
 
   const withoutSubagents = withoutSubagentsSkill(result);
-  const routable = {
-    skills: withoutSubagents.skills.filter((skill) => isRoutableSkillName(skill.name)),
-    diagnostics: withoutSubagents.diagnostics,
-  };
-  if (!config.subagents.enabled) return routable;
+  const available = config.experimentalSkillUris
+    ? {
+        skills: withoutSubagents.skills.filter((skill) => isRoutableSkillName(skill.name)),
+        diagnostics: withoutSubagents.diagnostics,
+      }
+    : withoutSubagents;
+  if (!config.subagents.enabled) return available;
 
   const managedDir = dirname(join(config.devspaceSkillsDir, SUBAGENTS_SKILL));
   const managed = loadSkillsFromDir({
@@ -127,8 +129,8 @@ export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSk
   }
 
   return {
-    skills: [...routable.skills, managed],
-    diagnostics: routable.diagnostics,
+    skills: [...available.skills, managed],
+    diagnostics: available.diagnostics,
   };
 }
 
@@ -145,7 +147,28 @@ function withoutSubagentsSkill(result: LoadSkillsResult): LoadedSkills {
 export function resolveSkillReadPath(
   skills: Skill[],
   inputPath: string,
+  experimentalSkillUris: boolean,
 ): SkillReadResolution | undefined {
+  if (!experimentalSkillUris) {
+    const absolutePath = resolve(expandHomePath(inputPath));
+
+    for (const skill of skills) {
+      const skillFilePath = resolve(skill.filePath);
+      if (absolutePath === skillFilePath) {
+        return { absolutePath, skill };
+      }
+    }
+
+    for (const skill of skills) {
+      const baseDir = resolve(skill.baseDir);
+      if (!isPathInsideRoot(absolutePath, baseDir)) continue;
+
+      return { absolutePath, skill };
+    }
+
+    return undefined;
+  }
+
   if (!inputPath.startsWith(SKILL_URI_PREFIX)) return undefined;
 
   const skillReference = inputPath.slice(SKILL_URI_PREFIX.length);
@@ -187,6 +210,18 @@ export function formatSkillUri(skill: Skill): string {
     throw new Error(`Invalid skill name for skills:// URI: ${skill.name}`);
   }
   return `${SKILL_URI_PREFIX}${skill.name}`;
+}
+
+export function formatPathForPrompt(path: string): string {
+  const home = resolve(homedir());
+  const resolvedPath = resolve(path);
+
+  if (resolvedPath === home) return "~";
+  if (resolvedPath.startsWith(`${home}${sep}`)) {
+    return `~/${resolvedPath.slice(home.length + 1).split(sep).join("/")}`;
+  }
+
+  return resolvedPath.split(sep).join("/");
 }
 
 function isRoutableSkillName(name: string): boolean {
