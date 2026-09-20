@@ -116,6 +116,7 @@ test("Claude edit and bash tools accept snake_case runtime inputs", async (t) =>
     name: "edit",
     arguments: {
       workspace_id: workspaceId,
+      operation_id: "op-test-edit-snake",
       path: "note.txt",
       edits: [{ old_text: "before", new_text: "after" }],
     },
@@ -127,11 +128,38 @@ test("Claude edit and bash tools accept snake_case runtime inputs", async (t) =>
     name: "bash",
     arguments: {
       workspace_id: workspaceId,
+      operation_id: "op-test-bash-snake",
       command: "pwd",
       working_directory: "nested",
     },
   }));
   assert.match(shell.result as string, /nested/i);
+});
+
+test("Claude bash replays an identical operation_id without repeating the command", async (t) => {
+  const context = await fixture(t, { toolMode: "claude", uiEnabled: false });
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "operation-replay-claude"),
+  ).workspace_id;
+  assert.equal(typeof workspaceId, "string");
+
+  const request = {
+    name: "bash",
+    arguments: {
+      workspace_id: workspaceId,
+      operation_id: "op-test-bash-replay",
+      command: "printf 'x\\n' >> once.txt",
+    },
+  } as const;
+
+  const first = structuredContent(await context.client.callTool(request));
+  const replay = structuredContent(await context.client.callTool(request));
+
+  assert.equal(first.operation_replayed, false);
+  assert.equal(replay.operation_replayed, true);
+  assert.equal(first.operation_id, "op-test-bash-replay");
+  assert.equal(replay.operation_id, "op-test-bash-replay");
+  assert.equal(await readFile(join(context.project, "once.txt"), "utf8"), "x\n");
 });
 
 test("read rejects a symlink that leaves the workspace", async (t) => {
@@ -170,6 +198,7 @@ test("write rejects a new file through a symlink that leaves the workspace", asy
     name: "write",
     arguments: {
       workspace_id: workspaceId,
+      operation_id: "op-test-write-symlink",
       path: "outside-link/new.txt",
       content: "escaped\n",
     },
@@ -601,6 +630,63 @@ test("HTTP endpoint serves modern MCP and stateless legacy clients", async (t) =
   assert.match(await legacyTools.text(), /"open_workspace"/);
 });
 
+test("client abort does not poison later MCP requests", async (t) => {
+  const { root, localBaseUrl, accessToken } = await httpServerFixture(
+    t,
+    "devspace-client-abort-test-",
+  );
+  const opened = await postModernMcp(
+    localBaseUrl,
+    accessToken,
+    "tools/call",
+    {
+      name: "open_workspace",
+      arguments: { path: root },
+      _meta: { "openai/session": "client-abort-test" },
+    },
+  );
+  const openBody = await opened.json() as {
+    result?: { structuredContent?: { workspace_id?: string } };
+  };
+  const workspaceId = openBody.result?.structuredContent?.workspace_id;
+  assert.equal(typeof workspaceId, "string");
+
+  const command = [
+    "const fs=require('node:fs')",
+    "fs.writeFileSync('started','')",
+    "const timer=setInterval(()=>{if(fs.existsSync('release')){clearInterval(timer);process.exit(0)}},10)",
+  ].join(";");
+  const abort = new AbortController();
+  const toolCall = postModernMcp(
+    localBaseUrl,
+    accessToken,
+    "tools/call",
+    {
+      name: "exec_command",
+      arguments: {
+        workspace_id: workspaceId,
+        cmd: `node -e "${command}"`,
+        yield_time_ms: 12_000,
+      },
+    },
+    abort.signal,
+  );
+
+  await waitForFile(join(root, "started"));
+  abort.abort();
+  await assert.rejects(toolCall, /abort/i);
+  await writeFile(join(root, "release"), "");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const afterAbort = await postModernMcp(
+    localBaseUrl,
+    accessToken,
+    "tools/list",
+    {},
+  );
+  assert.equal(afterAbort.status, 200, await afterAbort.clone().text());
+});
+
 test("server shutdown waits for an active MCP tool call", async (t) => {
   const { root, localBaseUrl, accessToken, running } = await httpServerFixture(
     t,
@@ -927,6 +1013,7 @@ function postModernMcp(
   accessToken: string | undefined,
   method: string,
   params: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const mcpName = typeof params.name === "string"
     ? params.name
@@ -935,6 +1022,7 @@ function postModernMcp(
       : undefined;
   return fetch(`${localBaseUrl}/mcp`, {
     method: "POST",
+    signal,
     headers: {
       ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
       "content-type": "application/json",

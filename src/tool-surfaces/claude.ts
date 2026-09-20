@@ -5,11 +5,17 @@ import {
   writeFileTool,
 } from "../pi-tools.js";
 import {
+  OPERATION_ID_DESCRIPTION,
+  OPERATION_ID_PATTERN,
+  runRecoverableOperation,
+} from "../operation-receipts.js";
+import {
   EDIT_TOOL_ANNOTATIONS,
   SHELL_TOOL_ANNOTATIONS,
   WRITE_TOOL_ANNOTATIONS,
   toolNames,
   workspaceIdDescription,
+  type ToolContent,
   type ToolInstructionContext,
   type ToolRegistrationContext,
 } from "./types.js";
@@ -22,7 +28,7 @@ import {
   textBlock,
 } from "./shared.js";
 
-const CLAUDE_INSTRUCTIONS = `Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.`;
+const CLAUDE_INSTRUCTIONS = `Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope. For each side-effecting ${toolNames.write}, ${toolNames.edit}, or ${toolNames.shell} call, choose a fresh operation_id and reuse that same ID only for an exact retry after an unknown or lost response.`;
 
 export function claudeInstructions({
   agents,
@@ -38,6 +44,47 @@ export function registerClaudeTools(context: ToolRegistrationContext): void {
 
 const CLAUDE_SHELL_DESCRIPTION = "Run a shell command in a workspace with the user's local permissions.";
 
+interface RecoverableToolResponse {
+  [key: string]: unknown;
+  content: ToolContent[];
+  details?: unknown;
+  isError?: boolean;
+  structuredContent?: Record<string, unknown>;
+}
+
+const operationIdSchema = z
+  .string()
+  .regex(OPERATION_ID_PATTERN)
+  .describe(OPERATION_ID_DESCRIPTION);
+
+function recoverableOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
+  return resultOutputSchema({
+    operation_id: z.string(),
+    operation_replayed: z
+      .boolean()
+      .describe(
+        "True when DevSpace returned the stored result of an earlier identical operation instead of repeating its local side effect.",
+      ),
+    ...extra,
+  });
+}
+
+function attachRecoveryMetadata(
+  response: RecoverableToolResponse,
+  operationId: string,
+  replayed: boolean,
+): RecoverableToolResponse {
+  if (!response.structuredContent) return response;
+  return {
+    ...response,
+    structuredContent: {
+      ...response.structuredContent,
+      operation_id: operationId,
+      operation_replayed: replayed,
+    },
+  };
+}
+
 function registerClaudeMutationTools(context: ToolRegistrationContext): void {
   const { server, config, workspaces } = context;
 
@@ -48,49 +95,64 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
       description: "Create or completely overwrite a file in a workspace.",
       inputSchema: {
         workspace_id: z.string().describe(workspaceIdDescription),
+        operation_id: operationIdSchema,
         path: z
           .string()
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: recoverableOutputSchema(),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspace_id, ...input }) => {
-      const startedAt = performance.now();
+    async ({ workspace_id, operation_id, ...input }) => {
       const workspaceId = workspace_id;
-      const workspace = await workspaces.getWorkspace(workspaceId);
-      const path = await workspaces.resolvePath(workspace, input.path);
-      const response = await writeFileTool({ ...input, path }, { cwd: workspace.root });
+      const recovered = await runRecoverableOperation<RecoverableToolResponse>({
+        workspaceId,
+        operationId: operation_id,
+        tool: toolNames.write,
+        request: input,
+        execute: async () => {
+          const startedAt = performance.now();
+          const workspace = await workspaces.getWorkspace(workspaceId);
+          const path = await workspaces.resolvePath(workspace, input.path);
+          const response = await writeFileTool({ ...input, path }, { cwd: workspace.root });
 
-      if (response.isError) {
-        logFailedToolResponse(
-          config,
-          {
+          if (response.isError) {
+            logFailedToolResponse(
+              config,
+              {
+                tool: toolNames.write,
+                workspaceId,
+                path: input.path,
+              },
+              response.content,
+              startedAt,
+            );
+            return response;
+          }
+
+          logToolCall(config, {
             tool: toolNames.write,
             workspaceId,
             path: input.path,
-          },
-          response.content,
-          startedAt,
-        );
-        return response;
-      }
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
 
-      logToolCall(config, {
-        tool: toolNames.write,
-        workspaceId,
-        path: input.path,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
+          return {
+            ...response,
+            structuredContent: {
+              result: contentText(response.content),
+            },
+          };
+        },
       });
 
-      return {
-        ...response,
-        structuredContent: {
-          result: contentText(response.content),
-        },
-      };
+      return attachRecoveryMetadata(
+        recovered.value,
+        operation_id,
+        recovered.replayed,
+      );
     },
   );
 
@@ -102,6 +164,7 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
         "Edit one file in a workspace by replacing exact text blocks. Each old_text must match a unique, non-overlapping region of the original file.",
       inputSchema: {
         workspace_id: z.string().describe(workspaceIdDescription),
+        operation_id: operationIdSchema,
         path: z
           .string()
           .describe("File path to edit, relative to the workspace root."),
@@ -118,59 +181,74 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
           )
           .min(1),
       },
-      outputSchema: resultOutputSchema({
+      outputSchema: recoverableOutputSchema({
         status: z.literal("applied"),
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspace_id, edits, ...input }) => {
-      const startedAt = performance.now();
+    async ({ workspace_id, operation_id, edits, ...input }) => {
       const workspaceId = workspace_id;
-      const workspace = await workspaces.getWorkspace(workspaceId);
-      const path = await workspaces.resolvePath(workspace, input.path);
-      const response = await editFileTool({
-        ...input,
-        path,
-        edits: edits.map(({ old_text, new_text }) => ({
-          oldText: old_text,
-          newText: new_text,
-        })),
-      }, { cwd: workspace.root });
+      const request = { ...input, edits };
+      const recovered = await runRecoverableOperation<RecoverableToolResponse>({
+        workspaceId,
+        operationId: operation_id,
+        tool: toolNames.edit,
+        request,
+        execute: async () => {
+          const startedAt = performance.now();
+          const workspace = await workspaces.getWorkspace(workspaceId);
+          const path = await workspaces.resolvePath(workspace, input.path);
+          const response = await editFileTool({
+            ...input,
+            path,
+            edits: edits.map(({ old_text, new_text }) => ({
+              oldText: old_text,
+              newText: new_text,
+            })),
+          }, { cwd: workspace.root });
 
-      if (response.isError) {
-        logFailedToolResponse(
-          config,
-          {
+          if (response.isError) {
+            logFailedToolResponse(
+              config,
+              {
+                tool: toolNames.edit,
+                workspaceId,
+                path: input.path,
+              },
+              response.content,
+              startedAt,
+            );
+            return response;
+          }
+
+          const stats = countDiffStats(
+            response.details?.patch ?? response.details?.diff,
+          );
+          const editResultText = `Edited ${input.path} (+${stats.additions} -${stats.removals}).`;
+          const editContent = [textBlock(editResultText)];
+          logToolCall(config, {
             tool: toolNames.edit,
             workspaceId,
             path: input.path,
-          },
-          response.content,
-          startedAt,
-        );
-        return response;
-      }
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
 
-      const stats = countDiffStats(
-        response.details?.patch ?? response.details?.diff,
-      );
-      const editResultText = `Edited ${input.path} (+${stats.additions} -${stats.removals}).`;
-      const editContent = [textBlock(editResultText)];
-      logToolCall(config, {
-        tool: toolNames.edit,
-        workspaceId,
-        path: input.path,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
+          return {
+            content: editContent,
+            structuredContent: {
+              status: "applied",
+              result: contentText(editContent),
+            },
+          };
+        },
       });
 
-      return {
-        content: editContent,
-        structuredContent: {
-          status: "applied",
-          result: contentText(editContent),
-        },
-      };
+      return attachRecoveryMetadata(
+        recovered.value,
+        operation_id,
+        recovered.replayed,
+      );
     },
   );
 }
@@ -185,6 +263,7 @@ function registerShellTool(context: ToolRegistrationContext): void {
       description: CLAUDE_SHELL_DESCRIPTION,
       inputSchema: {
         workspace_id: z.string().describe(workspaceIdDescription),
+        operation_id: operationIdSchema,
         command: z
           .string()
           .describe("Shell command to execute."),
@@ -201,54 +280,68 @@ function registerShellTool(context: ToolRegistrationContext): void {
           .optional()
           .describe("Timeout in seconds. Defaults to 30, max 300."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: recoverableOutputSchema(),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspace_id, working_directory, ...input }) => {
-      const startedAt = performance.now();
+    async ({ workspace_id, operation_id, working_directory, ...input }) => {
       const workspaceId = workspace_id;
       const workingDirectory = working_directory;
-      const workspace = await workspaces.getWorkspace(workspaceId);
-      const cwd = await workspaces.resolveWorkingDirectory(
-        workspace,
-        workingDirectory,
-      );
-      const response = await runShellTool(input, {
-        cwd,
-      });
+      const recovered = await runRecoverableOperation<RecoverableToolResponse>({
+        workspaceId,
+        operationId: operation_id,
+        tool: toolNames.shell,
+        request: { ...input, working_directory: workingDirectory },
+        execute: async () => {
+          const startedAt = performance.now();
+          const workspace = await workspaces.getWorkspace(workspaceId);
+          const cwd = await workspaces.resolveWorkingDirectory(
+            workspace,
+            workingDirectory,
+          );
+          const response = await runShellTool(input, {
+            cwd,
+          });
 
-      if (response.isError) {
-        logFailedToolResponse(
-          config,
-          {
+          if (response.isError) {
+            logFailedToolResponse(
+              config,
+              {
+                tool: toolNames.shell,
+                workspaceId,
+                workingDirectory: workingDirectory ?? ".",
+                command: input.command,
+                commandLength: input.command.length,
+              },
+              response.content,
+              startedAt,
+            );
+            return response;
+          }
+
+          logToolCall(config, {
             tool: toolNames.shell,
             workspaceId,
             workingDirectory: workingDirectory ?? ".",
             command: input.command,
             commandLength: input.command.length,
-          },
-          response.content,
-          startedAt,
-        );
-        return response;
-      }
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
 
-      logToolCall(config, {
-        tool: toolNames.shell,
-        workspaceId,
-        workingDirectory: workingDirectory ?? ".",
-        command: input.command,
-        commandLength: input.command.length,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
+          return {
+            ...response,
+            structuredContent: {
+              result: contentText(response.content),
+            },
+          };
+        },
       });
 
-      return {
-        ...response,
-        structuredContent: {
-          result: contentText(response.content),
-        },
-      };
+      return attachRecoveryMetadata(
+        recovered.value,
+        operation_id,
+        recovered.replayed,
+      );
     },
   );
 }

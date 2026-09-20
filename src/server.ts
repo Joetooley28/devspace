@@ -32,6 +32,11 @@ import {
   requestPath,
 } from "./logger.js";
 import { readFileTool } from "./pi-tools.js";
+import {
+  OPERATION_ID_DESCRIPTION,
+  OPERATION_ID_PATTERN,
+  runRecoverableOperation,
+} from "./operation-receipts.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
   compileMcpRegistrationSurface,
@@ -873,9 +878,10 @@ function registerLocalAgentTools(
     {
       title: "Start subagent",
       description:
-        "Start one persistent DevSpace subagent in an already-open workspace. Use this instead of invoking devspace agents run through bash. Returns immediately with a durable agent_id; use get_subagent to observe progress and continue_subagent for follow-up turns.",
+        "Start one persistent DevSpace subagent in an already-open workspace. Use this instead of invoking devspace agents run through bash. Returns immediately with a durable agent_id; use get_subagent to observe progress and continue_subagent for follow-up turns. Use a fresh operation_id for a new launch and reuse it only for an exact retry after an unknown or lost response.",
       inputSchema: {
         workspace_id: z.string().describe(workspaceIdDescription),
+        operation_id: z.string().regex(OPERATION_ID_PATTERN).describe(OPERATION_ID_DESCRIPTION),
         target: z.string().describe("Enabled subagent profile or provider name, for example local-qwen38, pi, or cursor."),
         prompt: z.string().min(1).describe("Self-contained task for the subagent."),
         model: z.string().optional().describe("Optional explicit model override."),
@@ -885,31 +891,40 @@ function registerLocalAgentTools(
       outputSchema: agentRecordSchema,
       annotations: { readOnlyHint: false, idempotentHint: false },
     },
-    async ({ workspace_id, target, prompt, model, effort, write_mode }) => {
-      const startedAt = performance.now();
-      const workspace = await workspaces.getWorkspace(workspace_id);
-      const result = await client.start({
-        target,
-        prompt,
-        workspaceRoot: workspace.root,
-        workspaceId: workspace.id,
-        model,
-        effort,
-        writeMode: write_mode,
-      });
-      if (result.isErr()) return fail(result.error);
-      logToolCall(config, {
+    async ({ workspace_id, operation_id, target, prompt, model, effort, write_mode }) => {
+      const recovered = await runRecoverableOperation({
+        workspaceId: workspace_id,
+        operationId: operation_id,
         tool: "start_subagent",
-        workspaceId: workspace.id,
-        path: workspace.root,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
+        request: { target, prompt, model, effort, write_mode },
+        execute: async () => {
+          const startedAt = performance.now();
+          const workspace = await workspaces.getWorkspace(workspace_id);
+          const result = await client.start({
+            target,
+            prompt,
+            workspaceRoot: workspace.root,
+            workspaceId: workspace.id,
+            model,
+            effort,
+            writeMode: write_mode,
+          });
+          if (result.isErr()) return fail(result.error);
+          logToolCall(config, {
+            tool: "start_subagent",
+            workspaceId: workspace.id,
+            path: workspace.root,
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
+          const record = present(result.value);
+          return {
+            content: [textBlock("Started persistent subagent " + record.agent_id + " (" + record.profile_name + ", " + record.provider + "); status=" + record.status + ".")],
+            structuredContent: record,
+          };
+        },
       });
-      const record = present(result.value);
-      return {
-        content: [textBlock("Started persistent subagent " + record.agent_id + " (" + record.profile_name + ", " + record.provider + "); status=" + record.status + ".")],
-        structuredContent: record,
-      };
+      return recovered.value;
     },
   );
 
@@ -917,9 +932,10 @@ function registerLocalAgentTools(
     "continue_subagent",
     {
       title: "Continue subagent",
-      description: "Send a follow-up turn to an existing persistent DevSpace subagent in the same workspace. Reuses the provider session when available.",
+      description: "Send a follow-up turn to an existing persistent DevSpace subagent in the same workspace. Reuses the provider session when available. Use a fresh operation_id for a new turn and reuse it only for an exact retry after an unknown or lost response.",
       inputSchema: {
         workspace_id: z.string().describe(workspaceIdDescription),
+        operation_id: z.string().regex(OPERATION_ID_PATTERN).describe(OPERATION_ID_DESCRIPTION),
         agent_id: z.string().describe("Durable DevSpace agent id returned by start_subagent."),
         prompt: z.string().min(1).describe("Follow-up task or instruction."),
         model: z.string().optional().describe("Optional explicit model override."),
@@ -929,28 +945,37 @@ function registerLocalAgentTools(
       outputSchema: agentRecordSchema,
       annotations: { readOnlyHint: false, idempotentHint: false },
     },
-    async ({ workspace_id, agent_id, prompt, model, effort, write_mode }) => {
-      const startedAt = performance.now();
-      const workspace = await workspaces.getWorkspace(workspace_id);
-      const result = await client.continue(
-        agent_id,
-        prompt,
-        { model, effort, writeMode: write_mode },
-        { workspaceId: workspace.id, workspaceRoot: workspace.root },
-      );
-      if (result.isErr()) return fail(result.error);
-      logToolCall(config, {
+    async ({ workspace_id, operation_id, agent_id, prompt, model, effort, write_mode }) => {
+      const recovered = await runRecoverableOperation({
+        workspaceId: workspace_id,
+        operationId: operation_id,
         tool: "continue_subagent",
-        workspaceId: workspace.id,
-        path: workspace.root,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
+        request: { agent_id, prompt, model, effort, write_mode },
+        execute: async () => {
+          const startedAt = performance.now();
+          const workspace = await workspaces.getWorkspace(workspace_id);
+          const result = await client.continue(
+            agent_id,
+            prompt,
+            { model, effort, writeMode: write_mode },
+            { workspaceId: workspace.id, workspaceRoot: workspace.root },
+          );
+          if (result.isErr()) return fail(result.error);
+          logToolCall(config, {
+            tool: "continue_subagent",
+            workspaceId: workspace.id,
+            path: workspace.root,
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
+          const record = present(result.value);
+          return {
+            content: [textBlock("Continued subagent " + record.agent_id + "; status=" + record.status + ".")],
+            structuredContent: record,
+          };
+        },
       });
-      const record = present(result.value);
-      return {
-        content: [textBlock("Continued subagent " + record.agent_id + "; status=" + record.status + ".")],
-        structuredContent: record,
-      };
+      return recovered.value;
     },
   );
 
