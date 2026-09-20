@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
+import type { Server as HttpServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -80,6 +81,14 @@ import {
 } from "./tool-surfaces/types.js";
 
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
+
+export const DEVSPACE_HTTP_KEEP_ALIVE_TIMEOUT_MS = 5 * 60_000;
+export const DEVSPACE_HTTP_HEADERS_TIMEOUT_MS = DEVSPACE_HTTP_KEEP_ALIVE_TIMEOUT_MS + 5_000;
+
+export function configureHttpServerTransport(httpServer: HttpServer): void {
+  httpServer.keepAliveTimeout = DEVSPACE_HTTP_KEEP_ALIVE_TIMEOUT_MS;
+  httpServer.headersTimeout = DEVSPACE_HTTP_HEADERS_TIMEOUT_MS;
+}
 
 function mcpServerInfo() {
   return {
@@ -214,6 +223,17 @@ function sendJsonRpcError(
 }
 
 function requestLogFields(req: Request, config: ServerConfig): Record<string, unknown> {
+  const body = req.body as unknown;
+  const mcpMethod =
+    requestPath(req) === "/mcp"
+    && body !== null
+    && typeof body === "object"
+    && !Array.isArray(body)
+    && "method" in body
+    && typeof (body as { method?: unknown }).method === "string"
+      ? (body as { method: string }).method
+      : undefined;
+
   return {
     ip: requestIp(req, config.logging.trustProxy),
     host: req.header("host"),
@@ -221,6 +241,8 @@ function requestLogFields(req: Request, config: ServerConfig): Record<string, un
     origin: req.header("origin"),
     referer: req.header("referer"),
     contentLength: req.header("content-length"),
+    mcpProtocolVersion: req.header("mcp-protocol-version"),
+    mcpMethod,
   };
 }
 
@@ -1100,12 +1122,24 @@ export function createServer(
   app.use((req, res, next) => {
     const requestId = randomUUID();
     const startedAt = performance.now();
+    const path = requestPath(req);
+    const logRequest = config.logging.requests
+      && (config.logging.assets || !path.startsWith("/mcp-app-assets"));
+    let finished = false;
     res.locals.requestId = requestId;
 
+    if (logRequest) {
+      logEvent(config.logging, "info", "http_request_started", {
+        requestId,
+        method: req.method,
+        path,
+        ...requestLogFields(req, config),
+      });
+    }
+
     res.on("finish", () => {
-      const path = requestPath(req);
-      if (!config.logging.requests) return;
-      if (!config.logging.assets && path.startsWith("/mcp-app-assets")) return;
+      finished = true;
+      if (!logRequest) return;
 
       logEvent(config.logging, "info", "http_request", {
         requestId,
@@ -1113,6 +1147,21 @@ export function createServer(
         path,
         status: res.statusCode,
         durationMs: Math.round(performance.now() - startedAt),
+        ...requestLogFields(req, config),
+      });
+    });
+
+    res.on("close", () => {
+      if (finished || !logRequest) return;
+
+      logEvent(config.logging, "warn", "http_request_closed", {
+        requestId,
+        method: req.method,
+        path,
+        status: res.statusCode,
+        durationMs: Math.round(performance.now() - startedAt),
+        headersSent: res.headersSent,
+        writableEnded: res.writableEnded,
         ...requestLogFields(req, config),
       });
     });
@@ -1243,6 +1292,7 @@ if (await isMainModule()) {
     console.log(`native artifact download: ${artifactDownloadStatus}`);
     console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
   });
+  configureHttpServerTransport(httpServer);
 
   let shuttingDown = false;
   const shutdown = async () => {

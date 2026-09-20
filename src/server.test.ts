@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer, get as httpGet } from "node:http";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -14,12 +15,95 @@ import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
-import { createMcpServer, createServer } from "./server.js";
+import {
+  configureHttpServerTransport,
+  createMcpServer,
+  createServer,
+  DEVSPACE_HTTP_HEADERS_TIMEOUT_MS,
+  DEVSPACE_HTTP_KEEP_ALIVE_TIMEOUT_MS,
+} from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const execFileAsync = promisify(execFile);
+
+function parseJsonLogLine(line: string): Array<Record<string, unknown>> {
+  try {
+    const parsed = JSON.parse(line) as unknown;
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? [parsed as Record<string, unknown>]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+test("HTTP transport uses reverse-proxy-safe keep-alive timeouts", () => {
+  const httpServer = createHttpServer();
+  configureHttpServerTransport(httpServer);
+
+  assert.equal(httpServer.keepAliveTimeout, 300_000);
+  assert.equal(httpServer.keepAliveTimeout, DEVSPACE_HTTP_KEEP_ALIVE_TIMEOUT_MS);
+  assert.equal(httpServer.headersTimeout, 305_000);
+  assert.equal(httpServer.headersTimeout, DEVSPACE_HTTP_HEADERS_TIMEOUT_MS);
+});
+
+test("HTTP request logging records start and normal completion", async (t) => {
+  const context = await httpServerFixture(t, "devspace-request-log-complete-");
+  const lines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => lines.push(args.map(String).join(" "));
+
+  try {
+    const response = await fetch(`${context.localBaseUrl}/healthz`);
+    assert.equal(response.status, 200);
+    await response.text();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    console.log = originalLog;
+  }
+
+  const events = lines.flatMap(parseJsonLogLine);
+  const started = events.find((entry) => entry.event === "http_request_started" && entry.path === "/healthz");
+  const completed = events.find((entry) => entry.event === "http_request" && entry.path === "/healthz");
+
+  assert.ok(started);
+  assert.ok(completed);
+  assert.equal(started.requestId, completed.requestId);
+  assert.equal(completed.status, 200);
+});
+
+test("HTTP request logging records premature client close", async (t) => {
+  const context = await httpServerFixture(t, "devspace-request-log-close-");
+  context.running.app.get("/request-log-close-test", (_req, _res) => {
+    // Intentionally leave the response pending until the client disconnects.
+  });
+
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+
+  try {
+    await new Promise<void>((resolve) => {
+      const request = httpGet(`${context.localBaseUrl}/request-log-close-test`);
+      request.on("error", () => resolve());
+      request.on("socket", () => {
+        setTimeout(() => request.destroy(), 20);
+      });
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  const closed = warnings
+    .flatMap(parseJsonLogLine)
+    .find((entry) => entry.event === "http_request_closed" && entry.path === "/request-log-close-test");
+
+  assert.ok(closed);
+  assert.equal(closed.writableEnded, false);
+});
 
 test("tool modes expose the expected host-facing tool surface", async (t) => {
   const cases: Array<{
