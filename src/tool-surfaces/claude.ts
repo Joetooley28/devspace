@@ -9,6 +9,7 @@ import {
   OPERATION_ID_PATTERN,
   runRecoverableOperation,
 } from "../operation-receipts.js";
+import { conversationScopeIdFromRequestMeta } from "../request-meta.js";
 import {
   EDIT_TOOL_ANNOTATIONS,
   SHELL_TOOL_ANNOTATIONS,
@@ -86,7 +87,7 @@ function attachRecoveryMetadata(
 }
 
 function registerClaudeMutationTools(context: ToolRegistrationContext): void {
-  const { server, config, workspaces } = context;
+  const { server, config, workspaces, workspaceLeases } = context;
 
   server.registerTool(
     toolNames.write,
@@ -104,47 +105,55 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
       outputSchema: recoverableOutputSchema(),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspace_id, operation_id, ...input }) => {
+    async ({ workspace_id, operation_id, ...input }, { _meta }) => {
       const workspaceId = workspace_id;
+      const controllerId = conversationScopeIdFromRequestMeta(_meta)
+        ?? workspaceLeases.controllerForWorkspace(workspaceId);
       const recovered = await runRecoverableOperation<RecoverableToolResponse>({
         workspaceId,
         operationId: operation_id,
         tool: toolNames.write,
         request: input,
         execute: async () => {
-          const startedAt = performance.now();
           const workspace = await workspaces.getWorkspace(workspaceId);
-          const path = await workspaces.resolvePath(workspace, input.path);
-          const response = await writeFileTool({ ...input, path }, { cwd: workspace.root });
+          return workspaceLeases.runMutation(
+            workspace.canonicalRoot,
+            controllerId,
+            async () => {
+              const startedAt = performance.now();
+              const path = await workspaces.resolvePath(workspace, input.path);
+              const response = await writeFileTool({ ...input, path }, { cwd: workspace.root });
 
-          if (response.isError) {
-            logFailedToolResponse(
-              config,
-              {
+              if (response.isError) {
+                logFailedToolResponse(
+                  config,
+                  {
+                    tool: toolNames.write,
+                    workspaceId,
+                    path: input.path,
+                  },
+                  response.content,
+                  startedAt,
+                );
+                return response;
+              }
+
+              logToolCall(config, {
                 tool: toolNames.write,
                 workspaceId,
                 path: input.path,
-              },
-              response.content,
-              startedAt,
-            );
-            return response;
-          }
+                success: true,
+                durationMs: Math.round(performance.now() - startedAt),
+              });
 
-          logToolCall(config, {
-            tool: toolNames.write,
-            workspaceId,
-            path: input.path,
-            success: true,
-            durationMs: Math.round(performance.now() - startedAt),
-          });
-
-          return {
-            ...response,
-            structuredContent: {
-              result: contentText(response.content),
+              return {
+                ...response,
+                structuredContent: {
+                  result: contentText(response.content),
+                },
+              };
             },
-          };
+          );
         },
       });
 
@@ -186,8 +195,10 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspace_id, operation_id, edits, ...input }) => {
+    async ({ workspace_id, operation_id, edits, ...input }, { _meta }) => {
       const workspaceId = workspace_id;
+      const controllerId = conversationScopeIdFromRequestMeta(_meta)
+        ?? workspaceLeases.controllerForWorkspace(workspaceId);
       const request = { ...input, edits };
       const recovered = await runRecoverableOperation<RecoverableToolResponse>({
         workspaceId,
@@ -195,52 +206,58 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
         tool: toolNames.edit,
         request,
         execute: async () => {
-          const startedAt = performance.now();
           const workspace = await workspaces.getWorkspace(workspaceId);
-          const path = await workspaces.resolvePath(workspace, input.path);
-          const response = await editFileTool({
-            ...input,
-            path,
-            edits: edits.map(({ old_text, new_text }) => ({
-              oldText: old_text,
-              newText: new_text,
-            })),
-          }, { cwd: workspace.root });
+          return workspaceLeases.runMutation(
+            workspace.canonicalRoot,
+            controllerId,
+            async () => {
+              const startedAt = performance.now();
+              const path = await workspaces.resolvePath(workspace, input.path);
+              const response = await editFileTool({
+                ...input,
+                path,
+                edits: edits.map(({ old_text, new_text }) => ({
+                  oldText: old_text,
+                  newText: new_text,
+                })),
+              }, { cwd: workspace.root });
 
-          if (response.isError) {
-            logFailedToolResponse(
-              config,
-              {
+              if (response.isError) {
+                logFailedToolResponse(
+                  config,
+                  {
+                    tool: toolNames.edit,
+                    workspaceId,
+                    path: input.path,
+                  },
+                  response.content,
+                  startedAt,
+                );
+                return response;
+              }
+
+              const stats = countDiffStats(
+                response.details?.patch ?? response.details?.diff,
+              );
+              const editResultText = `Edited ${input.path} (+${stats.additions} -${stats.removals}).`;
+              const editContent = [textBlock(editResultText)];
+              logToolCall(config, {
                 tool: toolNames.edit,
                 workspaceId,
                 path: input.path,
-              },
-              response.content,
-              startedAt,
-            );
-            return response;
-          }
+                success: true,
+                durationMs: Math.round(performance.now() - startedAt),
+              });
 
-          const stats = countDiffStats(
-            response.details?.patch ?? response.details?.diff,
-          );
-          const editResultText = `Edited ${input.path} (+${stats.additions} -${stats.removals}).`;
-          const editContent = [textBlock(editResultText)];
-          logToolCall(config, {
-            tool: toolNames.edit,
-            workspaceId,
-            path: input.path,
-            success: true,
-            durationMs: Math.round(performance.now() - startedAt),
-          });
-
-          return {
-            content: editContent,
-            structuredContent: {
-              status: "applied",
-              result: contentText(editContent),
+              return {
+                content: editContent,
+                structuredContent: {
+                  status: "applied",
+                  result: contentText(editContent),
+                },
+              };
             },
-          };
+          );
         },
       });
 
@@ -254,7 +271,7 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
 }
 
 function registerShellTool(context: ToolRegistrationContext): void {
-  const { server, config, workspaces } = context;
+  const { server, config, workspaces, workspaceLeases } = context;
 
   server.registerTool(
     toolNames.shell,
@@ -283,8 +300,10 @@ function registerShellTool(context: ToolRegistrationContext): void {
       outputSchema: recoverableOutputSchema(),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspace_id, operation_id, working_directory, ...input }) => {
+    async ({ workspace_id, operation_id, working_directory, ...input }, { _meta }) => {
       const workspaceId = workspace_id;
+      const controllerId = conversationScopeIdFromRequestMeta(_meta)
+        ?? workspaceLeases.controllerForWorkspace(workspaceId);
       const workingDirectory = working_directory;
       const recovered = await runRecoverableOperation<RecoverableToolResponse>({
         workspaceId,
@@ -292,48 +311,54 @@ function registerShellTool(context: ToolRegistrationContext): void {
         tool: toolNames.shell,
         request: { ...input, working_directory: workingDirectory },
         execute: async () => {
-          const startedAt = performance.now();
           const workspace = await workspaces.getWorkspace(workspaceId);
-          const cwd = await workspaces.resolveWorkingDirectory(
-            workspace,
-            workingDirectory,
-          );
-          const response = await runShellTool(input, {
-            cwd,
-          });
+          return workspaceLeases.runMutation(
+            workspace.canonicalRoot,
+            controllerId,
+            async () => {
+              const startedAt = performance.now();
+              const cwd = await workspaces.resolveWorkingDirectory(
+                workspace,
+                workingDirectory,
+              );
+              const response = await runShellTool(input, {
+                cwd,
+              });
 
-          if (response.isError) {
-            logFailedToolResponse(
-              config,
-              {
+              if (response.isError) {
+                logFailedToolResponse(
+                  config,
+                  {
+                    tool: toolNames.shell,
+                    workspaceId,
+                    workingDirectory: workingDirectory ?? ".",
+                    command: input.command,
+                    commandLength: input.command.length,
+                  },
+                  response.content,
+                  startedAt,
+                );
+                return response;
+              }
+
+              logToolCall(config, {
                 tool: toolNames.shell,
                 workspaceId,
                 workingDirectory: workingDirectory ?? ".",
                 command: input.command,
                 commandLength: input.command.length,
-              },
-              response.content,
-              startedAt,
-            );
-            return response;
-          }
+                success: true,
+                durationMs: Math.round(performance.now() - startedAt),
+              });
 
-          logToolCall(config, {
-            tool: toolNames.shell,
-            workspaceId,
-            workingDirectory: workingDirectory ?? ".",
-            command: input.command,
-            commandLength: input.command.length,
-            success: true,
-            durationMs: Math.round(performance.now() - startedAt),
-          });
-
-          return {
-            ...response,
-            structuredContent: {
-              result: contentText(response.content),
+              return {
+                ...response,
+                structuredContent: {
+                  result: contentText(response.content),
+                },
+              };
             },
-          };
+          );
         },
       });
 

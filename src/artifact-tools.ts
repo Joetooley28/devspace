@@ -24,6 +24,8 @@ import {
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
 import { logEvent } from "./logger.js";
+import { conversationScopeIdFromRequestMeta } from "./request-meta.js";
+import { WorkspaceLeaseManager } from "./workspace-leases.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 
 const ARTIFACT_WRITE_ANNOTATIONS = {
@@ -52,6 +54,7 @@ const openAIFileReferenceInputSchema = z.strictObject({
 export interface ArtifactToolRegistrationOptions {
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
+  workspaceLeases?: WorkspaceLeaseManager;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
 }
 
@@ -84,6 +87,7 @@ export function registerArtifactTools(
   {
     config,
     workspaces,
+    workspaceLeases = new WorkspaceLeaseManager(),
     incomingArtifactAdapters = [],
   }: ArtifactToolRegistrationOptions,
 ): void {
@@ -113,20 +117,29 @@ export function registerArtifactTools(
       _meta: { "openai/fileParams": ["file"] },
       annotations: ARTIFACT_WRITE_ANNOTATIONS,
     },
-    async (input) => executeArtifactTool(config, input, async () => {
+    async (input, { _meta }) => executeArtifactTool(config, input, async () => {
       const workspace = await workspaces.getWorkspace(input.workspace_id);
-      const downloaded = await downloadIncomingArtifact({
-        registry: incomingRegistry,
-        workspaceId: workspace.id,
-        workspaceRoot: workspace.root,
-        maxFileBytes: config.artifactMaxFileBytes,
-        file: input.file,
-        path: input.path,
-      });
-      return {
-        publicResult: { path: downloaded.path },
-        logResult: downloaded,
-      };
+      const controllerId = conversationScopeIdFromRequestMeta(_meta)
+        ?? workspaceLeases.controllerForWorkspace(workspace.id);
+      return workspaceLeases.runMutation(
+        workspace.canonicalRoot,
+        controllerId,
+        async () => {
+          const downloaded = await downloadIncomingArtifact({
+            registry: incomingRegistry,
+            workspaceId: workspace.id,
+            workspaceRoot: workspace.root,
+            maxFileBytes: config.artifactMaxFileBytes,
+            file: input.file,
+            path: input.path,
+          });
+          return {
+            publicResult: { path: downloaded.path },
+            logResult: downloaded,
+          };
+        },
+        workspace.id,
+      );
     }),
   );
 }

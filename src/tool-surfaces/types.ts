@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ProcessSessionManager } from "../process-sessions.js";
 import type { ServerConfig } from "../config.js";
+import type { WorkspaceLeaseManager } from "../workspace-leases.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 
 export const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
@@ -80,6 +81,7 @@ export interface ToolRegistrationContext {
   server: Pick<McpServer, "registerTool" | "registerResource">;
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
+  workspaceLeases: WorkspaceLeaseManager;
   processSessions: ProcessSessionManager;
 }
 

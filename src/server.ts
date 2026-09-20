@@ -52,6 +52,7 @@ import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { DEVSPACE_VERSION } from "./version.js";
 import { createWorkspaceStore } from "./workspace-store.js";
+import { WorkspaceLeaseManager } from "./workspace-leases.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
   getLocalAgentProviderAvailabilitySnapshot,
@@ -341,6 +342,7 @@ export function createMcpServer(
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   trackToolActivity?: TrackToolActivity,
+  workspaceLeases = new WorkspaceLeaseManager(),
 ): McpServer {
   const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
@@ -359,6 +361,7 @@ export function createMcpServer(
     resolveLocalAgentProviders,
     incomingArtifactAdapters,
     trackToolActivity,
+    workspaceLeases,
   );
   return server;
 }
@@ -371,7 +374,8 @@ function registerMcpSurface(
   processSessions: ProcessSessionManager,
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
-  trackToolActivity?: TrackToolActivity,
+  trackToolActivity: TrackToolActivity | undefined,
+  workspaceLeases: WorkspaceLeaseManager,
 ): void {
   const registrationTarget = trackToolActivity
     ? withTrackedToolHandlers(server, trackToolActivity)
@@ -437,6 +441,10 @@ function registerMcpSurface(
         workspace_id: z.string(),
         root: z.string(),
         mode: z.enum(["checkout", "worktree"]),
+        write_lease: z.object({
+          status: z.enum(["owned", "busy", "untracked"]),
+          retry_after_ms: z.number().int().nonnegative().optional(),
+        }),
         source_root: z.string().optional(),
         worktree: z
           .object({
@@ -469,6 +477,7 @@ function registerMcpSurface(
     async ({ path, mode, base_ref }, { _meta }) => {
       const startedAt = performance.now();
       const baseRef = base_ref;
+      const controllerId = conversationScopeIdFromRequestMeta(_meta);
       const {
         workspace,
         agentsFiles,
@@ -477,7 +486,12 @@ function registerMcpSurface(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef },
-        { conversationScopeId: conversationScopeIdFromRequestMeta(_meta) },
+        { conversationScopeId: controllerId },
+      );
+      const writeLease = workspaceLeases.observeOpen(
+        workspace.canonicalRoot,
+        controllerId,
+        workspace.id,
       );
       const review = await reviewCheckpoints.initializeWorkspace({
         workspaceId: workspace.id,
@@ -535,13 +549,16 @@ function registerMcpSurface(
         : workspace.mode === "worktree"
           ? "Use this workspace_id for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
           : cardInstruction;
-      const instruction = preloadedSubagentInstructions && includeBootstrapContext
-        ? [
-            workspaceInstruction,
-            "Subagent workflow instructions:",
-            preloadedSubagentInstructions,
-          ].join("\n\n")
-        : workspaceInstruction;
+      const leaseInstruction = writeLease.state === "busy"
+        ? "Another controller currently holds this workspace's write lease. You may inspect it with read-only tools, but do not retry or start write/edit/bash/subagent mutations until the lease expires or a later open_workspace reports write_lease.status=owned."
+        : undefined;
+      const instruction = [
+        workspaceInstruction,
+        leaseInstruction,
+        preloadedSubagentInstructions && includeBootstrapContext
+          ? ["Subagent workflow instructions:", preloadedSubagentInstructions].join("\n\n")
+          : undefined,
+      ].filter(Boolean).join("\n\n");
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -553,6 +570,11 @@ function registerMcpSurface(
                 : `Opened workspace ${workspace.id}.`,
             `Root: ${workspace.root}`,
             `Mode: ${workspace.mode}`,
+            writeLease.state === "owned"
+              ? "Write lease: owned by this controller."
+              : writeLease.state === "busy"
+                ? `Write lease: busy; another controller is active${writeLease.retryAfterMs !== undefined ? ` for approximately ${Math.ceil(writeLease.retryAfterMs / 1000)} more seconds` : ""}. Read-only inspection is allowed.`
+                : "Write lease: untracked because this MCP host did not provide a controller identity.",
             loadedAgentsFiles.length > 0
               ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
               : undefined,
@@ -592,6 +614,7 @@ function registerMcpSurface(
             includeBootstrapContext,
             sourceRoot: workspace.sourceRoot,
             worktree: workspace.worktree,
+            writeLease,
             agentsFiles: cardAgentsFiles,
             availableAgentsFiles: cardAvailableAgentsFiles,
             skills: cardSkills,
@@ -613,6 +636,10 @@ function registerMcpSurface(
           workspace_id: workspace.id,
           root: workspace.root,
           mode: workspace.mode,
+          write_lease: {
+            status: writeLease.state,
+            retry_after_ms: writeLease.retryAfterMs,
+          },
           source_root: workspace.sourceRoot,
           worktree: workspace.worktree
             ? {
@@ -682,10 +709,15 @@ function registerMcpSurface(
       outputSchema: resultOutputSchema(),
       annotations: { readOnlyHint: true },
     },
-    async ({ workspace_id, ...input }) => {
+    async ({ workspace_id, ...input }, { _meta }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
       const workspace = await workspaces.getWorkspace(workspaceId);
+      workspaceLeases.touchIfOwner(
+        workspace.canonicalRoot,
+        conversationScopeIdFromRequestMeta(_meta),
+        workspace.id,
+      );
       const readPath = await workspaces.resolveReadPath(workspace, input.path);
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
@@ -719,13 +751,14 @@ function registerMcpSurface(
   );
 
   if (config.subagents.enabled) {
-    registerLocalAgentTools(registrationTarget, config, workspaces);
+    registerLocalAgentTools(registrationTarget, config, workspaces, workspaceLeases);
   }
 
   toolSurface.register({
     server: registrationTarget,
     config,
     workspaces,
+    workspaceLeases,
     processSessions,
   });
 
@@ -750,6 +783,11 @@ function registerMcpSurface(
       const startedAt = performance.now();
       const workspaceId = workspace_id;
       const workspace = await workspaces.getWorkspace(workspaceId);
+      workspaceLeases.touchIfOwner(
+        workspace.canonicalRoot,
+        conversationScopeIdFromRequestMeta(_meta),
+        workspace.id,
+      );
       const reviewRef = typeof _meta?.["devspace/reviewRef"] === "string"
         ? _meta["devspace/reviewRef"]
         : undefined;
@@ -798,6 +836,7 @@ function registerMcpSurface(
     registerArtifactTools(registrationTarget, {
       config,
       workspaces,
+      workspaceLeases,
       incomingArtifactAdapters,
     });
   }
@@ -829,6 +868,7 @@ function registerLocalAgentTools(
   server: McpRegistrationTarget,
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
+  workspaceLeases: WorkspaceLeaseManager,
 ): void {
   const client = createLocalAgentClient(config);
   const agentRecordSchema = {
@@ -913,7 +953,9 @@ function registerLocalAgentTools(
       outputSchema: agentRecordSchema,
       annotations: { readOnlyHint: false, idempotentHint: false },
     },
-    async ({ workspace_id, operation_id, target, prompt, model, effort, write_mode }) => {
+    async ({ workspace_id, operation_id, target, prompt, model, effort, write_mode }, { _meta }) => {
+      const controllerId = conversationScopeIdFromRequestMeta(_meta)
+        ?? workspaceLeases.controllerForWorkspace(workspace_id);
       const recovered = await runRecoverableOperation({
         workspaceId: workspace_id,
         operationId: operation_id,
@@ -922,6 +964,7 @@ function registerLocalAgentTools(
         execute: async () => {
           const startedAt = performance.now();
           const workspace = await workspaces.getWorkspace(workspace_id);
+          return workspaceLeases.runMutation(workspace.canonicalRoot, controllerId, async () => {
           const result = await client.start({
             target,
             prompt,
@@ -944,6 +987,7 @@ function registerLocalAgentTools(
             content: [textBlock("Started persistent subagent " + record.agent_id + " (" + record.profile_name + ", " + record.provider + "); status=" + record.status + ".")],
             structuredContent: record,
           };
+          });
         },
       });
       return recovered.value;
@@ -967,7 +1011,9 @@ function registerLocalAgentTools(
       outputSchema: agentRecordSchema,
       annotations: { readOnlyHint: false, idempotentHint: false },
     },
-    async ({ workspace_id, operation_id, agent_id, prompt, model, effort, write_mode }) => {
+    async ({ workspace_id, operation_id, agent_id, prompt, model, effort, write_mode }, { _meta }) => {
+      const controllerId = conversationScopeIdFromRequestMeta(_meta)
+        ?? workspaceLeases.controllerForWorkspace(workspace_id);
       const recovered = await runRecoverableOperation({
         workspaceId: workspace_id,
         operationId: operation_id,
@@ -976,6 +1022,7 @@ function registerLocalAgentTools(
         execute: async () => {
           const startedAt = performance.now();
           const workspace = await workspaces.getWorkspace(workspace_id);
+          return workspaceLeases.runMutation(workspace.canonicalRoot, controllerId, async () => {
           const result = await client.continue(
             agent_id,
             prompt,
@@ -995,6 +1042,7 @@ function registerLocalAgentTools(
             content: [textBlock("Continued subagent " + record.agent_id + "; status=" + record.status + ".")],
             structuredContent: record,
           };
+          });
         },
       });
       return recovered.value;
@@ -1013,8 +1061,13 @@ function registerLocalAgentTools(
       outputSchema: agentRecordSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ workspace_id, agent_id }) => {
+    async ({ workspace_id, agent_id }, { _meta }) => {
       const workspace = await workspaces.getWorkspace(workspace_id);
+      workspaceLeases.touchIfOwner(
+        workspace.canonicalRoot,
+        conversationScopeIdFromRequestMeta(_meta),
+        workspace.id,
+      );
       const result = await client.get(agent_id, { workspaceId: workspace.id, workspaceRoot: workspace.root });
       if (result.isErr()) return fail(result.error);
       const record = present(result.value);
@@ -1034,8 +1087,13 @@ function registerLocalAgentTools(
       outputSchema: { agents: z.array(z.object(agentRecordSchema)) },
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
-    async ({ workspace_id }) => {
+    async ({ workspace_id }, { _meta }) => {
       const workspace = await workspaces.getWorkspace(workspace_id);
+      workspaceLeases.touchIfOwner(
+        workspace.canonicalRoot,
+        conversationScopeIdFromRequestMeta(_meta),
+        workspace.id,
+      );
       const result = await client.list({ workspaceId: workspace.id, workspaceRoot: workspace.root });
       if (result.isErr()) return fail(result.error);
       const agents = result.value.map(present);
@@ -1070,6 +1128,7 @@ export function createServer(
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
+  const workspaceLeases = new WorkspaceLeaseManager();
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   const toolActivities = new ToolActivityTracker();
@@ -1092,6 +1151,7 @@ export function createServer(
       resolveLocalAgentProviders,
       incomingArtifactAdapters,
       toolActivities.track,
+      workspaceLeases,
     );
   });
   const logMcpHandlerError = (error: Error) => logEvent(

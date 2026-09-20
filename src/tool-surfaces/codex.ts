@@ -1,5 +1,6 @@
 import * as z from "zod/v4";
 import { applyPatch } from "../apply-patch.js";
+import { conversationScopeIdFromRequestMeta } from "../request-meta.js";
 import {
   MAX_PROCESS_YIELD_MS,
   type ProcessSnapshot,
@@ -78,7 +79,7 @@ function processToolResponse(snapshot: ProcessSnapshot) {
 }
 
 function registerApplyPatchTool(context: ToolRegistrationContext): void {
-  const { server, config, workspaces } = context;
+  const { server, config, workspaces, workspaceLeases } = context;
 
   server.registerTool(
     "apply_patch",
@@ -107,17 +108,22 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspace_id, patch }) => {
+    async ({ workspace_id, patch }, { _meta }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
+      const workspace = await workspaces.getWorkspace(workspaceId);
+      const controllerId = conversationScopeIdFromRequestMeta(_meta)
+        ?? workspaceLeases.controllerForWorkspace(workspaceId);
       const applied = await runLoggedToolOperation(
         config,
         { tool: "apply_patch", workspaceId },
         startedAt,
-        async () => {
-          const workspace = await workspaces.getWorkspace(workspaceId);
-          return applyPatch(workspace.root, patch);
-        },
+        () => workspaceLeases.runMutation(
+          workspace.canonicalRoot,
+          controllerId,
+          () => applyPatch(workspace.root, patch),
+          workspaceId,
+        ),
       );
       const paths = applied.files.map((file) => file.path).join(", ");
       const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
@@ -140,7 +146,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
 }
 
 function registerCodexProcessTools(context: ToolRegistrationContext): void {
-  const { server, config, workspaces, processSessions } = context;
+  const { server, config, workspaces, workspaceLeases, processSessions } = context;
 
   server.registerTool(
     "exec_command",
@@ -206,12 +212,15 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       working_directory,
       yield_time_ms,
       max_output_tokens,
-    }) => {
+    }, { _meta }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
       const workingDirectory = working_directory;
       const yieldTimeMs = yield_time_ms;
       const maxOutputTokens = max_output_tokens;
+      const workspace = await workspaces.getWorkspace(workspaceId);
+      const controllerId = conversationScopeIdFromRequestMeta(_meta)
+        ?? workspaceLeases.controllerForWorkspace(workspaceId);
       const snapshot = await runLoggedToolOperation(
         config,
         {
@@ -222,24 +231,28 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
           commandLength: cmd.length,
         },
         startedAt,
-        async () => {
-          const workspace = await workspaces.getWorkspace(workspaceId);
-          const cwd = await workspaces.resolveWorkingDirectory(
-            workspace,
-            workingDirectory,
-          );
-          return processSessions.start({
-            workspaceId,
-            command: cmd,
-            cwd,
-            workspaceRoot: workspace.root,
-            tty,
-            columns,
-            rows,
-            yieldTimeMs,
-            maxOutputTokens,
-          });
-        },
+        () => workspaceLeases.runMutation(
+          workspace.canonicalRoot,
+          controllerId,
+          async () => {
+            const cwd = await workspaces.resolveWorkingDirectory(
+              workspace,
+              workingDirectory,
+            );
+            return processSessions.start({
+              workspaceId,
+              command: cmd,
+              cwd,
+              workspaceRoot: workspace.root,
+              tty,
+              columns,
+              rows,
+              yieldTimeMs,
+              maxOutputTokens,
+            });
+          },
+          workspaceId,
+        ),
         processLogFields,
       );
 
@@ -308,19 +321,23 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       rows,
       yield_time_ms,
       max_output_tokens,
-    }) => {
+    }, { _meta }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
       const sessionId = session_id;
       const yieldTimeMs = yield_time_ms;
       const maxOutputTokens = max_output_tokens;
+      const workspace = await workspaces.getWorkspace(workspaceId);
+      const controllerId = conversationScopeIdFromRequestMeta(_meta)
+        ?? workspaceLeases.controllerForWorkspace(workspaceId);
       const snapshot = await runLoggedToolOperation(
         config,
         { tool: "write_stdin", workspaceId },
         startedAt,
-        async () => {
-          await workspaces.getWorkspace(workspaceId);
-          return processSessions.write({
+        () => workspaceLeases.runMutation(
+          workspace.canonicalRoot,
+          controllerId,
+          () => processSessions.write({
             workspaceId,
             sessionId,
             chars,
@@ -328,8 +345,9 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
             rows,
             yieldTimeMs,
             maxOutputTokens,
-          });
-        },
+          }),
+          workspaceId,
+        ),
         processLogFields,
       );
 

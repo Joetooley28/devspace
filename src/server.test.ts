@@ -601,6 +601,100 @@ test("open_workspace scopes checkout reuse to OpenAI session metadata", async (t
   assert.ok(Array.isArray(structuredContent(unscoped).agents_files));
 });
 
+test("workspace lease blocks a competing conversation while preserving read access", async (t) => {
+  const context = await fixture(t, { toolMode: "claude", uiEnabled: false });
+  await writeFile(join(context.project, "shared.txt"), "initial\n");
+
+  const ownerOpen = structuredContent(
+    await callOpen(context.client, context.project, "lease-owner"),
+  );
+  const observerOpen = structuredContent(
+    await callOpen(context.client, context.project, "lease-observer"),
+  );
+  const ownerWorkspaceId = ownerOpen.workspace_id;
+  const observerWorkspaceId = observerOpen.workspace_id;
+  assert.equal(typeof ownerWorkspaceId, "string");
+  assert.equal(typeof observerWorkspaceId, "string");
+  assert.notEqual(observerWorkspaceId, ownerWorkspaceId);
+  assert.equal(recordValue(ownerOpen.write_lease).status, "owned");
+  assert.equal(recordValue(observerOpen.write_lease).status, "busy");
+
+  const readResult = await context.client.callTool({
+    name: "read",
+    arguments: {
+      workspace_id: observerWorkspaceId,
+      path: "shared.txt",
+    },
+  });
+  assert.equal(readResult.isError, undefined);
+
+  const blockedWrite = await context.client.callTool({
+    name: "write",
+    arguments: {
+      workspace_id: observerWorkspaceId,
+      operation_id: "op-lease-observer-write",
+      path: "shared.txt",
+      content: "observer\n",
+    },
+  });
+  assert.equal(blockedWrite.isError, true);
+  assert.match(JSON.stringify(blockedWrite.content ?? []), /workspace_busy/i);
+  assert.equal(await readFile(join(context.project, "shared.txt"), "utf8"), "initial\n");
+
+  const ownerWrite = await context.client.callTool({
+    name: "write",
+    arguments: {
+      workspace_id: ownerWorkspaceId,
+      operation_id: "op-lease-owner-write",
+      path: "shared.txt",
+      content: "owner\n",
+    },
+  });
+  assert.equal(ownerWrite.isError, undefined);
+  assert.equal(await readFile(join(context.project, "shared.txt"), "utf8"), "owner\n");
+});
+
+test("workspace lease also blocks competing Codex command execution", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+
+  const ownerOpen = structuredContent(
+    await callOpen(context.client, context.project, "codex-lease-owner"),
+  );
+  const observerOpen = structuredContent(
+    await callOpen(context.client, context.project, "codex-lease-observer"),
+  );
+  const ownerWorkspaceId = ownerOpen.workspace_id;
+  const observerWorkspaceId = observerOpen.workspace_id;
+  assert.equal(typeof ownerWorkspaceId, "string");
+  assert.equal(typeof observerWorkspaceId, "string");
+
+  const blocked = await context.client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspace_id: observerWorkspaceId,
+      cmd: "printf observer > codex-lease.txt",
+      yield_time_ms: 1_000,
+    },
+  });
+  assert.equal(blocked.isError, true);
+  assert.match(JSON.stringify(blocked.content ?? []), /workspace_busy/i);
+  await assert.rejects(access(join(context.project, "codex-lease.txt")));
+
+  const owner = await context.client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspace_id: ownerWorkspaceId,
+      cmd: "printf owner > codex-lease.txt",
+      yield_time_ms: 1_000,
+    },
+  });
+  assert.equal(owner.isError, undefined);
+  assert.equal(
+    await readFile(join(context.project, "codex-lease.txt"), "utf8"),
+    "owner",
+  );
+});
+
 test("HTTP endpoint serves modern MCP and stateless legacy clients", async (t) => {
   const { root, localBaseUrl, accessToken } = await httpServerFixture(
     t,
