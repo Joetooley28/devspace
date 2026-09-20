@@ -196,6 +196,7 @@ devspace doctor
 - [Native File Download](https://github.com/Waishnav/devspace/blob/main/docs/artifact-exchange.md)
 - [Security Model](https://github.com/Waishnav/devspace/blob/main/docs/security.md)
 - [Troubleshooting Gotchas](https://github.com/Waishnav/devspace/blob/main/docs/gotchas.md)
+- [AI Hub Pi Rollback Points](docs/pi-rollback-points.md) — local deployment recovery checkpoints, including the pre–durable-Phase-2 rollback.
 
 ## Philosophy
 
