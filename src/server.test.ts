@@ -654,6 +654,55 @@ test("workspace lease blocks a competing conversation while preserving read acce
   assert.equal(await readFile(join(context.project, "shared.txt"), "utf8"), "owner\n");
 });
 
+test("managed worktree remains independently writable while source checkout has another writer", async (t) => {
+  const context = await fixture(t, { toolMode: "claude", uiEnabled: false, git: true });
+
+  const checkoutOpen = structuredContent(
+    await callOpen(context.client, context.project, "checkout-owner"),
+  );
+  const worktreeOpen = structuredContent(await context.client.callTool({
+    name: "open_workspace",
+    arguments: { path: context.project, mode: "worktree" },
+    _meta: { "openai/session": "worktree-owner" },
+  }));
+
+  const checkoutWorkspaceId = checkoutOpen.workspace_id;
+  const worktreeWorkspaceId = worktreeOpen.workspace_id;
+  const worktreeRoot = worktreeOpen.root;
+  assert.equal(typeof checkoutWorkspaceId, "string");
+  assert.equal(typeof worktreeWorkspaceId, "string");
+  assert.equal(typeof worktreeRoot, "string");
+  assert.equal(recordValue(checkoutOpen.write_lease).status, "owned");
+  assert.equal(recordValue(worktreeOpen.write_lease).status, "owned");
+
+  const checkoutWrite = await context.client.callTool({
+    name: "write",
+    arguments: {
+      workspace_id: checkoutWorkspaceId,
+      operation_id: "op-independent-checkout-write",
+      path: "checkout-only.txt",
+      content: "checkout\n",
+    },
+    _meta: { "openai/session": "checkout-owner" },
+  });
+  assert.equal(checkoutWrite.isError, undefined);
+
+  const worktreeWrite = await context.client.callTool({
+    name: "write",
+    arguments: {
+      workspace_id: worktreeWorkspaceId,
+      operation_id: "op-independent-worktree-write",
+      path: "worktree-only.txt",
+      content: "worktree\n",
+    },
+    _meta: { "openai/session": "worktree-owner" },
+  });
+  assert.equal(worktreeWrite.isError, undefined);
+
+  assert.equal(await readFile(join(context.project, "checkout-only.txt"), "utf8"), "checkout\n");
+  assert.equal(await readFile(join(worktreeRoot as string, "worktree-only.txt"), "utf8"), "worktree\n");
+});
+
 test("workspace lease also blocks competing Codex command execution", async (t) => {
   const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
 
@@ -672,6 +721,7 @@ test("workspace lease also blocks competing Codex command execution", async (t) 
     name: "exec_command",
     arguments: {
       workspace_id: observerWorkspaceId,
+      operation_id: "op-codex-lease-observer",
       cmd: "printf observer > codex-lease.txt",
       yield_time_ms: 1_000,
     },
@@ -684,6 +734,7 @@ test("workspace lease also blocks competing Codex command execution", async (t) 
     name: "exec_command",
     arguments: {
       workspace_id: ownerWorkspaceId,
+      operation_id: "op-codex-lease-owner",
       cmd: "printf owner > codex-lease.txt",
       yield_time_ms: 1_000,
     },
@@ -831,22 +882,25 @@ test("client abort does not poison later MCP requests", async (t) => {
 
   const command = [
     "const fs=require('node:fs')",
+    "fs.appendFileSync('executions','x\\n')",
     "fs.writeFileSync('started','')",
     "const timer=setInterval(()=>{if(fs.existsSync('release')){clearInterval(timer);process.exit(0)}},10)",
   ].join(";");
+  const execRequest = {
+    name: "exec_command",
+    arguments: {
+      workspace_id: workspaceId,
+      operation_id: "op-codex-abort-active-call",
+      cmd: `node -e "${command}"`,
+      yield_time_ms: 12_000,
+    },
+  };
   const abort = new AbortController();
   const toolCall = postModernMcp(
     localBaseUrl,
     accessToken,
     "tools/call",
-    {
-      name: "exec_command",
-      arguments: {
-        workspace_id: workspaceId,
-        cmd: `node -e "${command}"`,
-        yield_time_ms: 12_000,
-      },
-    },
+    execRequest,
     abort.signal,
   );
 
@@ -855,6 +909,19 @@ test("client abort does not poison later MCP requests", async (t) => {
   await assert.rejects(toolCall, /abort/i);
   await writeFile(join(root, "release"), "");
   await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const replay = await postModernMcp(
+    localBaseUrl,
+    accessToken,
+    "tools/call",
+    execRequest,
+  );
+  assert.equal(replay.status, 200, await replay.clone().text());
+  const replayBody = await replay.json() as {
+    result?: { structuredContent?: { operation_replayed?: boolean } };
+  };
+  assert.equal(replayBody.result?.structuredContent?.operation_replayed, true);
+  assert.equal(await readFile(join(root, "executions"), "utf8"), "x\n");
 
   const afterAbort = await postModernMcp(
     localBaseUrl,
@@ -899,6 +966,7 @@ test("server shutdown waits for an active MCP tool call", async (t) => {
       name: "exec_command",
       arguments: {
         workspace_id: workspaceId,
+        operation_id: "op-codex-shutdown-active-call",
         cmd: `node -e \"${command}\"`,
         yield_time_ms: 12_000,
       },

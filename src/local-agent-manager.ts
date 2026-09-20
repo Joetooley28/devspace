@@ -198,17 +198,14 @@ export class LocalAgentManager {
     if (lookup.isErr()) return lookup;
     const record = lookup.value;
     if (!record) return Result.err(agentNotFound(agentId));
-    const scoped = this.agentWorkspaceResult(record, scope, "get");
+    const scoped = this.agentWorkspaceResult(record, scope, "get", true);
     if (scoped.isErr()) return scoped;
     return Result.ok(record);
   }
 
   list(scope: LocalAgentWorkspaceScope): BetterResult<LocalAgentRecord[], AgentListError> {
     return this.authorizeWorkspace(scope.workspaceRoot, scope.workspaceId, "list").andThen((workspaceRoot) => (
-      this.store.listResult({
-        workspaceId: scope.workspaceId,
-        workspaceRoot,
-      })
+      this.store.listResult({ workspaceRoot })
     ));
   }
 
@@ -595,11 +592,12 @@ export class LocalAgentManager {
     record: LocalAgentRecord,
     scope: LocalAgentWorkspaceScope,
     operation: string,
+    allowWorkspaceIdMismatch = false,
   ): BetterResult<void, AgentScopeError> {
     const workspaceRoot = this.authorizeWorkspace(scope.workspaceRoot, scope.workspaceId, operation);
     if (workspaceRoot.isErr()) return workspaceRoot;
     const idMismatch = scope.workspaceId !== undefined && record.workspaceId !== scope.workspaceId;
-    if (workspaceRoot.value !== record.workspaceRoot || idMismatch) {
+    if (workspaceRoot.value !== record.workspaceRoot || (idMismatch && !allowWorkspaceIdMismatch)) {
       return Result.err(new AgentScopeError({
         code: "WORKSPACE_MISMATCH",
         agentId: record.id,

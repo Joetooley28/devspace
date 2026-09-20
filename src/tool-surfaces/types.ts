@@ -1,4 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { OperationReceiptManager } from "../operation-receipts.js";
 import type { ProcessSessionManager } from "../process-sessions.js";
 import type { ServerConfig } from "../config.js";
 import type { WorkspaceLeaseManager } from "../workspace-leases.js";
@@ -82,6 +83,7 @@ export interface ToolRegistrationContext {
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
   workspaceLeases: WorkspaceLeaseManager;
+  operationReceipts: OperationReceiptManager;
   processSessions: ProcessSessionManager;
 }
 

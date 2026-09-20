@@ -7,7 +7,6 @@ import {
 import {
   OPERATION_ID_DESCRIPTION,
   OPERATION_ID_PATTERN,
-  runRecoverableOperation,
 } from "../operation-receipts.js";
 import { conversationScopeIdFromRequestMeta } from "../request-meta.js";
 import {
@@ -87,7 +86,7 @@ function attachRecoveryMetadata(
 }
 
 function registerClaudeMutationTools(context: ToolRegistrationContext): void {
-  const { server, config, workspaces, workspaceLeases } = context;
+  const { server, config, workspaces, workspaceLeases, operationReceipts } = context;
 
   server.registerTool(
     toolNames.write,
@@ -109,7 +108,7 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
       const workspaceId = workspace_id;
       const controllerId = conversationScopeIdFromRequestMeta(_meta)
         ?? workspaceLeases.controllerForWorkspace(workspaceId);
-      const recovered = await runRecoverableOperation<RecoverableToolResponse>({
+      const recovered = await operationReceipts.run<RecoverableToolResponse>({
         workspaceId,
         operationId: operation_id,
         tool: toolNames.write,
@@ -200,7 +199,7 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
       const controllerId = conversationScopeIdFromRequestMeta(_meta)
         ?? workspaceLeases.controllerForWorkspace(workspaceId);
       const request = { ...input, edits };
-      const recovered = await runRecoverableOperation<RecoverableToolResponse>({
+      const recovered = await operationReceipts.run<RecoverableToolResponse>({
         workspaceId,
         operationId: operation_id,
         tool: toolNames.edit,
@@ -271,7 +270,7 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
 }
 
 function registerShellTool(context: ToolRegistrationContext): void {
-  const { server, config, workspaces, workspaceLeases } = context;
+  const { server, config, workspaces, workspaceLeases, operationReceipts } = context;
 
   server.registerTool(
     toolNames.shell,
@@ -305,7 +304,7 @@ function registerShellTool(context: ToolRegistrationContext): void {
       const controllerId = conversationScopeIdFromRequestMeta(_meta)
         ?? workspaceLeases.controllerForWorkspace(workspaceId);
       const workingDirectory = working_directory;
-      const recovered = await runRecoverableOperation<RecoverableToolResponse>({
+      const recovered = await operationReceipts.run<RecoverableToolResponse>({
         workspaceId,
         operationId: operation_id,
         tool: toolNames.shell,

@@ -47,6 +47,50 @@ Do not call `open_workspace` again for the same checkout folder unless:
 - work moves to a different project folder
 - work switches between checkout and worktree mode
 - the user asks for a new isolated worktree
+- a reconnect needs to inspect or explicitly take over a stale writer lease
+
+## Workspace Writer Coordination
+
+Checkout workspaces have one writer at a time. When host conversation metadata is
+available, DevSpace durably associates that controller with the checkout and
+returns a `write_lease` from `open_workspace`.
+
+A second controller may still inspect the same checkout with read-only tools.
+Its `write_lease.status` is `busy`, and mutations such as file writes, edits,
+shell commands, process input, and subagent starts/continuations fail closed
+instead of racing the active writer.
+
+Writer leases are persisted in DevSpace state with a heartbeat, expiry, and
+monotonically increasing generation. Reconnecting from the same logical
+controller renews the existing generation after a DevSpace restart. An expired
+lease is reported as stale but is not silently stolen. A different controller
+must explicitly reopen the checkout with:
+
+```json
+{
+  "path": "~/work/my-project",
+  "takeover": true
+}
+```
+
+Explicit takeover succeeds only for a stale lease and advances the generation,
+which acts as a fencing token for later lease renewals. When parallel writing is
+actually intended, prefer `mode: "worktree"`; each managed worktree has its own
+root and independent writer lease.
+
+Side-effecting tools that expose `operation_id` use it as a durable retry key.
+Use a fresh ID for each new logical action and reuse that ID only for an exact
+retry after a lost or unknown response. Completed results are replayed without
+repeating the local side effect, including after a DevSpace restart. If a crash
+leaves a durable receipt in the running state, DevSpace reports the outcome as
+unknown and does not execute the action again; inspect the workspace before
+deciding on a genuinely new operation.
+
+Persistent subagents are durable independently of a particular ChatGPT
+connection. Same-root read-only inspection may surface agents created by an
+older controller so reconnecting chats can reuse existing work instead of
+blindly launching duplicates. Continuing an agent remains a writer-scoped
+operation.
 
 ## Checkout Mode
 

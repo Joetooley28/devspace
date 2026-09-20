@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { OperationReceiptManager } from "./operation-receipts.js";
+import { openDatabase } from "./db/client.js";
+import {
+  OperationOutcomeUnknownError,
+  OperationReceiptManager,
+} from "./operation-receipts.js";
 
 const op = (suffix: string) => `op-test-${suffix}`;
 
@@ -189,4 +196,125 @@ test("rejects malformed operation ids before execution", async () => {
     execute: async () => ++executions,
   }), /operation_id must be/);
   assert.equal(executions, 0);
+});
+
+test("durable receipt replays after a server restart without executing twice", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "devspace-op-receipt-restart-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+
+  let executions = 0;
+  const input = {
+    workspaceId: "ws_restart",
+    operationId: op("restart-replay"),
+    tool: "bash",
+    request: { command: "printf once" },
+    execute: async () => {
+      executions += 1;
+      return { result: "executed" };
+    },
+  };
+
+  const first = new OperationReceiptManager({ stateDir });
+  assert.deepEqual(await first.run(input), {
+    value: { result: "executed" },
+    replayed: false,
+  });
+  first.close();
+
+  const restarted = new OperationReceiptManager({ stateDir });
+  assert.deepEqual(await restarted.run({
+    ...input,
+    execute: async () => {
+      executions += 1;
+      return { result: "duplicate" };
+    },
+  }), {
+    value: { result: "executed" },
+    replayed: true,
+  });
+  restarted.close();
+  assert.equal(executions, 1);
+});
+
+test("durable running receipt fails closed after restart instead of repeating an unknown side effect", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "devspace-op-receipt-unknown-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+
+  const bootstrap = new OperationReceiptManager({ stateDir });
+  bootstrap.close();
+
+  const database = openDatabase(stateDir);
+  database.sqlite.prepare(
+    `insert into operation_receipts (
+       workspace_id, operation_id, tool, fingerprint, status, started_at
+     ) values (?, ?, ?, ?, 'running', ?)`,
+  ).run(
+    "ws_unknown",
+    op("unknown"),
+    "bash",
+    "placeholder",
+    Date.now(),
+  );
+  database.close();
+
+  const restarted = new OperationReceiptManager({ stateDir });
+  let executions = 0;
+  await assert.rejects(
+    restarted.run({
+      workspaceId: "ws_unknown",
+      operationId: op("unknown"),
+      tool: "bash",
+      request: { command: "danger" },
+      execute: async () => ++executions,
+    }),
+    /different request/,
+  );
+  restarted.close();
+  assert.equal(executions, 0);
+});
+
+test("matching durable running receipt reports unknown outcome and never re-executes", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "devspace-op-receipt-running-"));
+  t.after(() => rm(stateDir, { recursive: true, force: true }));
+
+  const manager = new OperationReceiptManager({ stateDir });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const first = manager.run({
+    workspaceId: "ws_running",
+    operationId: op("running"),
+    tool: "bash",
+    request: { command: "danger" },
+    execute: async () => {
+      await gate;
+      return "done";
+    },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const database = openDatabase(stateDir);
+  const row = database.sqlite.prepare(
+    "select fingerprint from operation_receipts where workspace_id = ? and operation_id = ?",
+  ).get("ws_running", op("running")) as { fingerprint: string };
+  database.close();
+
+  const secondProcess = new OperationReceiptManager({ stateDir });
+  let duplicateExecutions = 0;
+  await assert.rejects(
+    secondProcess.run({
+      workspaceId: "ws_running",
+      operationId: op("running"),
+      tool: "bash",
+      request: { command: "danger" },
+      execute: async () => ++duplicateExecutions,
+    }),
+    OperationOutcomeUnknownError,
+  );
+  assert.ok(row.fingerprint.length > 0);
+  assert.equal(duplicateExecutions, 0);
+  secondProcess.close();
+
+  release();
+  assert.deepEqual(await first, { value: "done", replayed: false });
+  manager.close();
 });

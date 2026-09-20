@@ -117,6 +117,45 @@ export const localAgentSessions = sqliteTable(
   ],
 );
 
+
+export const workspaceWriteLeases = sqliteTable(
+  "workspace_write_leases",
+  {
+    workspaceKey: text("workspace_key").primaryKey(),
+    controllerId: text("controller_id").notNull(),
+    workspaceId: text("workspace_id"),
+    generation: integer("generation").notNull(),
+    acquiredAt: integer("acquired_at").notNull(),
+    heartbeatAt: integer("heartbeat_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (table) => [
+    index("workspace_write_leases_workspace_id_idx").on(table.workspaceId),
+    index("workspace_write_leases_expires_at_idx").on(table.expiresAt),
+  ],
+);
+
+export const operationReceipts = sqliteTable(
+  "operation_receipts",
+  {
+    workspaceId: text("workspace_id").notNull(),
+    operationId: text("operation_id").notNull(),
+    tool: text("tool").notNull(),
+    fingerprint: text("fingerprint").notNull(),
+    status: text("status").notNull(),
+    resultJson: text("result_json"),
+    errorMessage: text("error_message"),
+    errorCode: text("error_code"),
+    errorRetryable: text("error_retryable"),
+    startedAt: integer("started_at").notNull(),
+    settledAt: integer("settled_at"),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workspaceId, table.operationId] }),
+    index("operation_receipts_settled_at_idx").on(table.settledAt),
+  ],
+);
+
 export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;

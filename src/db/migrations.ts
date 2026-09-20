@@ -47,6 +47,11 @@ const migrations: Migration[] = [
     name: "local-agent-turns",
     up: migrateLocalAgentTurns,
   },
+  {
+    version: 9,
+    name: "workspace-coordination-state",
+    up: migrateWorkspaceCoordinationState,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -286,6 +291,44 @@ function migrateLocalAgentTurns(sqlite: Database.Database): void {
 
     create index if not exists local_agent_turns_status_idx
       on local_agent_turns(status);
+  `);
+}
+
+function migrateWorkspaceCoordinationState(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists workspace_write_leases (
+      workspace_key text primary key,
+      controller_id text not null,
+      workspace_id text,
+      generation integer not null,
+      acquired_at integer not null,
+      heartbeat_at integer not null,
+      expires_at integer not null
+    );
+
+    create index if not exists workspace_write_leases_workspace_id_idx
+      on workspace_write_leases(workspace_id);
+
+    create index if not exists workspace_write_leases_expires_at_idx
+      on workspace_write_leases(expires_at);
+
+    create table if not exists operation_receipts (
+      workspace_id text not null,
+      operation_id text not null,
+      tool text not null,
+      fingerprint text not null,
+      status text not null,
+      result_json text,
+      error_message text,
+      error_code text,
+      error_retryable text,
+      started_at integer not null,
+      settled_at integer,
+      primary key (workspace_id, operation_id)
+    );
+
+    create index if not exists operation_receipts_settled_at_idx
+      on operation_receipts(settled_at);
   `);
 }
 

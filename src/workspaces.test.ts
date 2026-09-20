@@ -160,6 +160,38 @@ test("persisted checkout and worktree sessions restore after recreating the regi
   }
 });
 
+test("same conversation reuses its checkout workspace after recreating the registry", async (t) => {
+  const context = await fixture(t);
+  const stateDir = join(context.root, ".conversation-state");
+  const firstStore = new SqliteWorkspaceStore(stateDir);
+  const firstRegistry = new WorkspaceRegistry(context.config, firstStore);
+
+  const first = await firstRegistry.openWorkspace(
+    context.root,
+    { conversationScopeId: "chat-reconnect" },
+  );
+  firstStore.close();
+
+  const secondStore = new SqliteWorkspaceStore(stateDir);
+  try {
+    const restartedRegistry = new WorkspaceRegistry(context.config, secondStore);
+    const reconnected = await restartedRegistry.openWorkspace(
+      context.root,
+      { conversationScopeId: "chat-reconnect" },
+    );
+    const differentController = await restartedRegistry.openWorkspace(
+      context.root,
+      { conversationScopeId: "chat-other" },
+    );
+
+    assert.equal(reconnected.workspace.id, first.workspace.id);
+    assert.equal(reconnected.workspaceReused, true);
+    assert.notEqual(differentController.workspace.id, first.workspace.id);
+  } finally {
+    secondStore.close();
+  }
+});
+
 test("using a pruned workspace id restores its tracked worktree state", async (t) => {
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);

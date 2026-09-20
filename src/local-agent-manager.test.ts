@@ -214,9 +214,23 @@ if (disabledContinuation.isErr()) assert.equal(disabledContinuation.error.code, 
 
 assert.equal(getRecord(stale.id).status, "running");
 
-const mismatchedGet = manager.get(stale.id, { workspaceId: "ws_current", workspaceRoot: root });
-assert.equal(mismatchedGet.isErr(), true);
-if (mismatchedGet.isErr()) assert.equal(mismatchedGet.error.code, "WORKSPACE_MISMATCH");
+const observerScope = { workspaceId: "ws_current", workspaceRoot: root };
+const observedGet = manager.get(stale.id, observerScope);
+assert.equal(observedGet.isOk(), true, "same-root observers can inspect durable agents from older chats");
+if (observedGet.isOk()) assert.equal(observedGet.value.id, stale.id);
+
+const observedList = unwrap(manager.list(observerScope));
+assert.equal(
+  observedList.some((agent) => agent.id === stale.id),
+  true,
+  "same-root agent listing exposes persistent agents so a new controller can avoid duplicates",
+);
+
+const mismatchedContinuation = await manager.continue(stale.id, "inspect", {}, observerScope);
+assert.equal(mismatchedContinuation.isErr(), true);
+if (mismatchedContinuation.isErr()) {
+  assert.equal(mismatchedContinuation.error.code, "WORKSPACE_MISMATCH");
+}
 
 unwrap(manager.reconcileActiveRuns());
 assert.equal(getRecord(stale.id).status, "error");
@@ -411,9 +425,20 @@ const direct = unwrap(await manager.start({
 await waitFor(() => unwrap(manager.get(direct.id, { workspaceRoot: root })).status === "idle");
 assert.equal(direct.workspaceId, undefined);
 assert.equal(unwrap(manager.get(first.id, { workspaceRoot: root })).id, first.id);
-const directWrongId = manager.get(direct.id, { workspaceId: "ws_other", workspaceRoot: root });
-assert.equal(directWrongId.isErr(), true);
-if (directWrongId.isErr()) assert.equal(directWrongId.error.code, "WORKSPACE_MISMATCH");
+const directObserver = manager.get(direct.id, { workspaceId: "ws_other", workspaceRoot: root });
+assert.equal(directObserver.isOk(), true);
+if (directObserver.isOk()) assert.equal(directObserver.value.id, direct.id);
+
+const directWrongIdContinuation = await manager.continue(
+  direct.id,
+  "observer must not continue",
+  {},
+  { workspaceId: "ws_other", workspaceRoot: root },
+);
+assert.equal(directWrongIdContinuation.isErr(), true);
+if (directWrongIdContinuation.isErr()) {
+  assert.equal(directWrongIdContinuation.error.code, "WORKSPACE_MISMATCH");
+}
 
 const defect = unwrap(await manager.start({
   target: "reviewer",

@@ -36,7 +36,7 @@ import { readFileTool } from "./pi-tools.js";
 import {
   OPERATION_ID_DESCRIPTION,
   OPERATION_ID_PATTERN,
-  runRecoverableOperation,
+  OperationReceiptManager,
 } from "./operation-receipts.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
@@ -343,6 +343,7 @@ export function createMcpServer(
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   trackToolActivity?: TrackToolActivity,
   workspaceLeases = new WorkspaceLeaseManager(),
+  operationReceipts = new OperationReceiptManager(),
 ): McpServer {
   const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
@@ -362,6 +363,7 @@ export function createMcpServer(
     incomingArtifactAdapters,
     trackToolActivity,
     workspaceLeases,
+    operationReceipts,
   );
   return server;
 }
@@ -376,6 +378,7 @@ function registerMcpSurface(
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   trackToolActivity: TrackToolActivity | undefined,
   workspaceLeases: WorkspaceLeaseManager,
+  operationReceipts: OperationReceiptManager,
 ): void {
   const registrationTarget = trackToolActivity
     ? withTrackedToolHandlers(server, trackToolActivity)
@@ -436,14 +439,25 @@ function registerMcpSurface(
           .string()
           .optional()
           .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
+        takeover: z
+          .boolean()
+          .optional()
+          .describe(
+            "Explicitly take over a stale checkout write lease. Active leases are never stolen. Defaults to false.",
+          ),
       },
       outputSchema: {
         workspace_id: z.string(),
         root: z.string(),
         mode: z.enum(["checkout", "worktree"]),
         write_lease: z.object({
-          status: z.enum(["owned", "busy", "untracked"]),
+          status: z.enum(["owned", "busy", "available", "untracked"]),
           retry_after_ms: z.number().int().nonnegative().optional(),
+          owner_workspace_id: z.string().optional(),
+          generation: z.number().int().positive().optional(),
+          last_heartbeat_at: z.string().optional(),
+          expires_at: z.string().optional(),
+          stale: z.boolean().optional(),
         }),
         source_root: z.string().optional(),
         worktree: z
@@ -474,7 +488,7 @@ function registerMcpSurface(
       ...workspaceAppDescriptorMeta(config),
       annotations: { readOnlyHint: true },
     },
-    async ({ path, mode, base_ref }, { _meta }) => {
+    async ({ path, mode, base_ref, takeover }, { _meta }) => {
       const startedAt = performance.now();
       const baseRef = base_ref;
       const controllerId = conversationScopeIdFromRequestMeta(_meta);
@@ -492,6 +506,7 @@ function registerMcpSurface(
         workspace.canonicalRoot,
         controllerId,
         workspace.id,
+        takeover ?? false,
       );
       const review = await reviewCheckpoints.initializeWorkspace({
         workspaceId: workspace.id,
@@ -550,7 +565,9 @@ function registerMcpSurface(
           ? "Use this workspace_id for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
           : cardInstruction;
       const leaseInstruction = writeLease.state === "busy"
-        ? "Another controller currently holds this workspace's write lease. You may inspect it with read-only tools, but do not retry or start write/edit/bash/subagent mutations until the lease expires or a later open_workspace reports write_lease.status=owned."
+        ? writeLease.stale
+          ? "Another controller's durable write lease is stale. You may inspect read-only state. To become the writer, explicitly reopen this checkout with takeover=true; alternatively open an isolated worktree for parallel work."
+          : "Another controller currently holds this workspace's write lease. You may inspect it with read-only tools, but do not retry or start write/edit/bash/subagent mutations. Wait for it to become stale or open an isolated worktree for parallel work."
         : undefined;
       const instruction = [
         workspaceInstruction,
@@ -571,10 +588,14 @@ function registerMcpSurface(
             `Root: ${workspace.root}`,
             `Mode: ${workspace.mode}`,
             writeLease.state === "owned"
-              ? "Write lease: owned by this controller."
+              ? `Write lease: owned by this controller (generation ${writeLease.generation ?? "unknown"}).`
               : writeLease.state === "busy"
-                ? `Write lease: busy; another controller is active${writeLease.retryAfterMs !== undefined ? ` for approximately ${Math.ceil(writeLease.retryAfterMs / 1000)} more seconds` : ""}. Read-only inspection is allowed.`
-                : "Write lease: untracked because this MCP host did not provide a controller identity.",
+                ? writeLease.stale
+                  ? "Write lease: stale owner exists; read-only inspection is allowed and explicit takeover=true is required before writes."
+                  : `Write lease: busy; another controller is active${writeLease.retryAfterMs !== undefined ? ` for approximately ${Math.ceil(writeLease.retryAfterMs / 1000)} more seconds` : ""}. Read-only inspection is allowed.`
+                : writeLease.state === "available"
+                  ? "Write lease: available."
+                  : "Write lease: untracked because this MCP host did not provide a controller identity.",
             loadedAgentsFiles.length > 0
               ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
               : undefined,
@@ -639,6 +660,15 @@ function registerMcpSurface(
           write_lease: {
             status: writeLease.state,
             retry_after_ms: writeLease.retryAfterMs,
+            owner_workspace_id: writeLease.ownerWorkspaceId,
+            generation: writeLease.generation,
+            last_heartbeat_at: writeLease.heartbeatAt === undefined
+              ? undefined
+              : new Date(writeLease.heartbeatAt).toISOString(),
+            expires_at: writeLease.expiresAt === undefined
+              ? undefined
+              : new Date(writeLease.expiresAt).toISOString(),
+            stale: writeLease.stale,
           },
           source_root: workspace.sourceRoot,
           worktree: workspace.worktree
@@ -751,7 +781,13 @@ function registerMcpSurface(
   );
 
   if (config.subagents.enabled) {
-    registerLocalAgentTools(registrationTarget, config, workspaces, workspaceLeases);
+    registerLocalAgentTools(
+      registrationTarget,
+      config,
+      workspaces,
+      workspaceLeases,
+      operationReceipts,
+    );
   }
 
   toolSurface.register({
@@ -759,6 +795,7 @@ function registerMcpSurface(
     config,
     workspaces,
     workspaceLeases,
+    operationReceipts,
     processSessions,
   });
 
@@ -869,6 +906,7 @@ function registerLocalAgentTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   workspaceLeases: WorkspaceLeaseManager,
+  operationReceipts: OperationReceiptManager,
 ): void {
   const client = createLocalAgentClient(config);
   const agentRecordSchema = {
@@ -956,7 +994,7 @@ function registerLocalAgentTools(
     async ({ workspace_id, operation_id, target, prompt, model, effort, write_mode }, { _meta }) => {
       const controllerId = conversationScopeIdFromRequestMeta(_meta)
         ?? workspaceLeases.controllerForWorkspace(workspace_id);
-      const recovered = await runRecoverableOperation({
+      const recovered = await operationReceipts.run({
         workspaceId: workspace_id,
         operationId: operation_id,
         tool: "start_subagent",
@@ -1014,7 +1052,7 @@ function registerLocalAgentTools(
     async ({ workspace_id, operation_id, agent_id, prompt, model, effort, write_mode }, { _meta }) => {
       const controllerId = conversationScopeIdFromRequestMeta(_meta)
         ?? workspaceLeases.controllerForWorkspace(workspace_id);
-      const recovered = await runRecoverableOperation({
+      const recovered = await operationReceipts.run({
         workspaceId: workspace_id,
         operationId: operation_id,
         tool: "continue_subagent",
@@ -1128,7 +1166,8 @@ export function createServer(
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
-  const workspaceLeases = new WorkspaceLeaseManager();
+  const workspaceLeases = new WorkspaceLeaseManager(undefined, undefined, config.stateDir);
+  const operationReceipts = new OperationReceiptManager({ stateDir: config.stateDir });
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   const toolActivities = new ToolActivityTracker();
@@ -1152,6 +1191,7 @@ export function createServer(
       incomingArtifactAdapters,
       toolActivities.track,
       workspaceLeases,
+      operationReceipts,
     );
   });
   const logMcpHandlerError = (error: Error) => logEvent(
@@ -1317,6 +1357,8 @@ export function createServer(
         await toolActivities.waitForIdle();
         processSessions.shutdown();
         oauthProvider.close();
+        operationReceipts.close();
+        workspaceLeases.close();
         workspaceStore.close?.();
       })();
       return closePromise;
